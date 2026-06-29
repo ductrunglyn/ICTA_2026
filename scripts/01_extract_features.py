@@ -30,6 +30,7 @@ from src.data.features import (  # noqa: E402
     TextFeatureExtractor,
     build_segment_feature,
     load_acoustic_csv,
+    load_audio_slice,
     load_visual_txt,
 )
 from src.data.segmentation import Segment, segment_participant  # noqa: E402
@@ -74,7 +75,9 @@ def process_participant(
     if transcript_path:
         tp = Path(_resolve(str(transcript_path), pid_local))
         if tp.exists():
-            transcript_df = pd.read_csv(tp, sep="\t" if tp.suffix == ".csv" else ",")
+            # DAIC transcripts are TAB-separated; honour an explicit override.
+            sep = spec.get("transcript_sep", "\t" if tp.suffix == ".csv" else ",")
+            transcript_df = pd.read_csv(tp, sep=sep)
 
     try:
         segments: List[Segment] = segment_participant(
@@ -108,9 +111,12 @@ def process_participant(
                 text_arr = text_fx.extract(seg.text)
             except Exception as exc:  # pragma: no cover - external model
                 logger.debug("Text features skipped for %s: %s", seg.seg_id, exc)
-        if extract_audio:
-            # TODO(external-data): requires waveform slicing + model weights.
-            logger.debug("Audio extraction enabled but slicing is corpus-specific.")
+        if extract_audio and audio_path and Path(audio_path).exists():
+            try:
+                wav = load_audio_slice(audio_path, seg.start_s, seg.end_s)
+                audio_arr = audio_fx.extract(wav)
+            except Exception as exc:  # pragma: no cover - external model/audio
+                logger.debug("Audio features skipped for %s: %s", seg.seg_id, exc)
 
         feat = build_segment_feature(
             seg, corpus=corpus, gender=int(row.get("gender", 0)),

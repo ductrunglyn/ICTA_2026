@@ -1,0 +1,25 @@
+# Single-corpus (DAIC-WOZ) experiment: audio + text modalities.
+#
+# With one corpus the corpus-adversary is a no-op (n_corpus=1), but the
+# gender-adversary and gender Group-DRO remain active for fairness/robustness.
+# LOCO is not applicable with a single corpus -> use pooled CV.
+model:
+  d: 128
+  use_adv: true          # gender-adversary still meaningful (corpus head inert)
+  use_group_dro: true    # groups = (corpus, gender) -> here just gender
+  use_irm: false
+  use_visual: false      # no CLNF in this dataset
+  n_gender: 2
+
+loss:
+  alpha: 0.3
+  beta: 0.5
+  pos_weight: 2.0
+
+cv:
+  n_folds: 5
+  seeds: [0, 1, 2, 3, 4]
+  mode: pooled
+  exp_name: daic_audio_text
+
+# Run with: --modalities audio,text  (acoustic/visual masked automatically)

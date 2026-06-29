@@ -1,34 +1,45 @@
 # Unified corpus schema. Every corpus is mapped to a common layout so the code
-# is corpus-agnostic. {pid} is substituted with the participant id.
+# is corpus-agnostic. {pid} is substituted with the participant id (e.g. 300).
+#
+# Current setup: DAIC-WOZ (AVEC2017) only. Folders are named <pid>_P and contain
+# <pid>_AUDIO.wav and <pid>_TRANSCRIPT.csv (tab-separated). The three labelled
+# split files are concatenated by 00_build_manifests.py and re-split later by the
+# leakage-free participant-level CV.
 daic_woz:
   corpus: daic
   language: en
-  audio_dir: data/raw/daic/{pid}/{pid}_AUDIO.wav
-  transcript: data/raw/daic/{pid}/{pid}_TRANSCRIPT.csv
-  prompts_speaker: Ellie            # interviewer name used to cut segments
-  label_csv: data/raw/daic/labels.csv   # Participant_ID, PHQ8_Binary, PHQ8_Score, Gender
-  acoustic: data/raw/daic/{pid}/{pid}_COVAREP.csv
-  visual: data/raw/daic/{pid}/{pid}_CLNF_AUs.txt
-  label_threshold: 10               # PHQ-8 >= 10 -> positive
+  audio_dir: data/raw/daic/{pid}_P/{pid}_AUDIO.wav
+  transcript: data/raw/daic/{pid}_P/{pid}_TRANSCRIPT.csv
+  transcript_sep: "\t"               # DAIC transcripts are TAB-separated
+  prompts_speaker: Ellie             # interviewer name used to cut segments
+  label_csv:                         # concatenated; blind test_split (no label) omitted
+    - data/raw/daic/train_split_Depression_AVEC2017.csv
+    - data/raw/daic/dev_split_Depression_AVEC2017.csv
+    - data/raw/daic/full_test_split.csv
+  # Optional modalities — used only if the files exist, otherwise masked.
+  acoustic: data/raw/daic/{pid}_P/{pid}_COVAREP.csv
+  visual: data/raw/daic/{pid}_P/{pid}_CLNF_AUs.txt
+  label_threshold: 10                # PHQ-8 >= 10 -> positive (already binarised here)
 
-eatd:
-  corpus: eatd
-  language: zh
-  audio_dir: data/raw/eatd/{pid}/*.wav
-  transcript: null
-  prompts_speaker: null             # no Ellie structure -> VAD segmentation
-  label_csv: data/raw/eatd/labels.csv
-  acoustic: null
-  visual: null
-  label_threshold: 53               # SDS index threshold (corpus convention)
-
-androids:
-  corpus: androids
-  language: it
-  audio_dir: data/raw/androids/{pid}/interview.wav
-  transcript: null
-  prompts_speaker: null
-  label_csv: data/raw/androids/labels.csv
-  acoustic: null
-  visual: null
-  label_threshold: null             # corpus provides binary labels directly
+# --- Additional corpora (enable when data is available) ----------------------
+# eatd:
+#   corpus: eatd
+#   language: zh
+#   audio_dir: data/raw/eatd/{pid}/*.wav
+#   transcript: null
+#   prompts_speaker: null            # no Ellie structure -> VAD segmentation
+#   label_csv: data/raw/eatd/labels.csv
+#   acoustic: null
+#   visual: null
+#   label_threshold: 53
+#
+# androids:
+#   corpus: androids
+#   language: it
+#   audio_dir: data/raw/androids/{pid}/interview.wav
+#   transcript: null
+#   prompts_speaker: null
+#   label_csv: data/raw/androids/labels.csv
+#   acoustic: null
+#   visual: null
+#   label_threshold: null

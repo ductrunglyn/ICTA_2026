@@ -150,6 +150,53 @@ def load_acoustic_csv(
     return ((sl - mu) / sigma).astype(np.float32)
 
 
+def load_audio_slice(
+    path: Union[str, Path],
+    start_s: float,
+    end_s: float,
+    sample_rate: int = 16000,
+) -> np.ndarray:
+    """Load a mono waveform slice ``[start_s, end_s)`` resampled to ``sample_rate``.
+
+    Tries ``torchaudio`` first, then ``soundfile``. The returned 1-D float32
+    array is what :meth:`AudioFeatureExtractor.extract` expects.
+
+    Args:
+        path: Path to a wav file.
+        start_s, end_s: Segment bounds in seconds.
+        sample_rate: Target sample rate.
+
+    Returns:
+        1-D ``float32`` waveform for the requested span.
+    """
+    try:
+        import torch  # noqa: F401
+        import torchaudio
+
+        wav, sr = torchaudio.load(str(path))           # (channels, n)
+        if wav.size(0) > 1:
+            wav = wav.mean(0, keepdim=True)            # to mono
+        if sr != sample_rate:
+            wav = torchaudio.functional.resample(wav, sr, sample_rate)
+        wav = wav.squeeze(0).numpy()
+    except ImportError:
+        import soundfile as sf  # type: ignore
+
+        wav, sr = sf.read(str(path), dtype="float32")
+        if wav.ndim > 1:
+            wav = wav.mean(axis=1)
+        if sr != sample_rate:  # pragma: no cover - depends on input rate
+            raise ValueError(
+                f"{path}: sample rate {sr} != {sample_rate} and torchaudio is "
+                "unavailable for resampling."
+            )
+    i0, i1 = int(start_s * sample_rate), int(end_s * sample_rate)
+    sl = np.asarray(wav[i0:i1], dtype=np.float32)
+    if sl.shape[0] == 0:
+        sl = np.zeros(sample_rate // 10, dtype=np.float32)  # 0.1s of silence
+    return sl
+
+
 def load_visual_txt(
     path: Union[str, Path],
     start_s: float,

@@ -37,20 +37,26 @@ scripts/      00_build_manifests, 01_extract_features, 02_run_cv, 03_make_report
 tests/        splitter, GRL, calibrator, model-forward smoke tests
 ```
 
-## Pipeline
+## Pipeline (DAIC-WOZ / AVEC2017)
+
+Place the corpus under `data/raw/daic/` (folders `<pid>_P/` with
+`<pid>_AUDIO.wav` + `<pid>_TRANSCRIPT.csv`, plus the `*_split_*.csv` label
+files). Paths live in `configs/corpora.yaml`.
 
 ```bash
-# 0) Build the participant-level manifest from corpus label files.
+# 0) Build the participant-level manifest (concatenates train/dev/full_test).
 python scripts/00_build_manifests.py --corpora configs/corpora.yaml
 
-# 1) Segment + extract & cache per-segment features.
-python scripts/01_extract_features.py --manifest data/manifests/all.csv
+# 1) Segment + extract features. --extract_audio runs the wav2vec2 backbone
+#    (heavy; needs transformers + torchaudio). Text comes from the transcript.
+python scripts/01_extract_features.py --manifest data/manifests/all.csv --extract_audio
 
-# 2) Run an experiment (5-fold x 5-seed leakage-free CV).
-python scripts/02_run_cv.py --experiment configs/experiments/E2_corpus_adv.yaml
+# 2) Run the DAIC experiment (5-fold x 5-seed leakage-free CV, audio+text).
+python scripts/02_run_cv.py --experiment configs/experiments/DAIC_audio_text.yaml \
+    --modalities audio,text
 
-# 3) Build the EvaluationCard (+ optional TOST vs a baseline).
-python scripts/03_make_report.py --exp E2_corpus_adv --baseline E0_acoustic_only
+# 3) Build the EvaluationCard.
+python scripts/03_make_report.py --exp daic_audio_text
 ```
 
 ## Tests
