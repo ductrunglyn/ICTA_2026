@@ -1,0 +1,14 @@
+# Versioned, public prompt -> question_type mapping (blueprint §3.3).
+# Keys are case-insensitive regex/substring patterns matched against the
+# interviewer prompt; the first match wins. Falls back to "other".
+version: 1
+
+mapping:
+  "hi|hello|how are you|nice to meet": greeting
+  "where are you from|where do you live|tell me about yourself|your hometown": background
+  "family|parents|kids|children|married|siblings": family
+  "feeling|mood|happy|sad|depressed|down|how have you been feeling": mood
+  "sleep|sleeping|rest|tired|insomnia|nightmares": sleep
+  "work|job|study|school|career|employed": work
+  "stress|stressed|argument|conflict|difficult|pressure|overwhelmed": stress
+  "therapy|diagnos|treatment|counsel|psycholog|medication|ptsd": therapy

@@ -1,0 +1,10 @@
+# LOCO: best configuration under leave-one-corpus-out (true transfer test).
+model:
+  use_adv: true
+  use_group_dro: true
+  use_irm: false
+loss:
+  beta: 0.5
+cv:
+  mode: loco
+  exp_name: LOCO_best

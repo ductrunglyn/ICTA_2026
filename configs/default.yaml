@@ -1,0 +1,47 @@
+# TransVal-Dep base hyper-parameters (source-of-truth = TransValDep_Design.md §10).
+model:
+  d: 128
+  use_adv: true
+  use_group_dro: true
+  use_irm: false
+  use_visual: true
+  n_corpus: 3
+  n_gender: 2
+
+loss:
+  alpha: 0.3        # segment auxiliary BCE weight
+  beta: 0.5         # corpus+gender adversary weight (via GRL)
+  gamma: 0.1        # IRM penalty weight
+  delta: 0.0        # intermodal consistency (off by default)
+  pos_weight: 2.0   # BCE positive class weight
+
+train:
+  epochs: 40
+  lr: 1.0e-3
+  batch_bags: 8
+  patience: 10
+  grad_clip: 1.0
+  weight_decay: 1.0e-5
+  grl_gamma: 10.0
+  device: cpu
+
+cv:
+  n_folds: 5
+  seeds: [0, 1, 2, 3, 4]
+  mode: pooled        # pooled | loco
+  inner_val_frac: 0.2
+  out_dir: outputs
+  exp_name: default
+
+calib:
+  method: isotonic            # isotonic | platt
+  threshold: youden_inner     # youden_inner | fixed
+
+stats:
+  eps_auc: 0.03
+  eps_f1: 0.05
+  bootstrap_n: 2000
+
+backbones:
+  audio: facebook/wav2vec2-xls-r-300m
+  text: xlm-roberta-base

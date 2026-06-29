@@ -1,0 +1,8 @@
+# E4: E3 + Group-DRO. Tests whether the hardest group improves.
+model:
+  use_adv: true
+  use_group_dro: true
+loss:
+  beta: 0.5
+cv:
+  exp_name: E4_group_dro

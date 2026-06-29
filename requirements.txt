@@ -1,0 +1,12 @@
+numpy>=1.23
+pandas>=1.5
+scipy>=1.9
+scikit-learn>=1.2
+torch>=2.0
+PyYAML>=6.0
+# Optional / external-data dependencies (feature extraction & VAD):
+# transformers>=4.30
+# torchaudio>=2.0
+# silero-vad>=5.0
+# pyarrow>=12.0   # for parquet prediction dumps
+pytest>=7.0

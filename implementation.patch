@@ -1,0 +1,4949 @@
+diff --git a/.gitignore b/.gitignore
+new file mode 100644
+index 0000000..5d58036
+--- /dev/null
++++ b/.gitignore
+@@ -0,0 +1,16 @@
++__pycache__/
++*.py[cod]
++.pytest_cache/
++.ipynb_checkpoints/
++*.egg-info/
++.venv/
++venv/
++
++# Data & artifacts (keep manifests dir, ignore heavy contents)
++data/raw/
++data/interim/
++outputs/
++*.pt
++*.npy
++*.parquet
++!data/manifests/.gitkeep
+diff --git a/README.md b/README.md
+index 768d77f..f6070f9 100644
+--- a/README.md
++++ b/README.md
+@@ -1 +1,69 @@
+-# ICTA_2026
+\ No newline at end of file
++# TransVal-Dep
++
++**Transferable-Validity Depression detection** — a multi-corpus,
++confound-controlled, calibration-first benchmark for depression detection from
++clinical interviews.
++
++This repository is the production-grade implementation of the design document
++[`TransValDep_Design.md`](TransValDep_Design.md). It asks: *which depression
++signals are genuinely about depression (not general distress) and genuinely
++transfer across corpora/languages?*
++
++## Five contributions
++
++| # | Contribution | Where |
++|---|---|---|
++| NV1 | Transferable-validity benchmark (leakage-free, participant-level CV; pooled + LOCO) | `src/data/splitter.py`, `src/train/cv_runner.py` |
++| NV2 | Confound-controlled evaluation (group AUC, residualized AUC, specificity-gap) | `src/eval/confound_eval.py` |
++| NV3 | Invariant representation learning (DANN adversary + Group-DRO + optional IRM) | `src/models/`, `src/losses/` |
++| NV4 | Calibration-first + selective prediction (Platt/Isotonic, risk-coverage, AURC) | `src/calibration/` |
++| NV5 | Sufficiently-powered statistics (multi-seed bootstrap CI, TOST equivalence) | `src/eval/stats.py` |
++
++Plus a revived **question-type validity probe** (`src/eval/probe.py`).
++
++## Layout
++
++```
++configs/      default + per-corpus + per-experiment configs, prompt2qtype.yaml
++src/
++  data/       segmentation, features, confounds, MIL dataset, leakage-free splitter, bag builder
++  models/     encoders, GRL, domain adversary, heads, TransValNet
++  losses/     Group-DRO, IRM penalty, intermodal consistency
++  calibration/calibrators (Platt/Isotonic), selective prediction
++  train/      per-fold trainer, multi-seed CV runner
++  eval/       metrics, confound evaluator, statistics, question-type probe
++  utils/      seeding, logging, config, registry
++scripts/      00_build_manifests, 01_extract_features, 02_run_cv, 03_make_report
++tests/        splitter, GRL, calibrator, model-forward smoke tests
++```
++
++## Pipeline
++
++```bash
++# 0) Build the participant-level manifest from corpus label files.
++python scripts/00_build_manifests.py --corpora configs/corpora.yaml
++
++# 1) Segment + extract & cache per-segment features.
++python scripts/01_extract_features.py --manifest data/manifests/all.csv
++
++# 2) Run an experiment (5-fold x 5-seed leakage-free CV).
++python scripts/02_run_cv.py --experiment configs/experiments/E2_corpus_adv.yaml
++
++# 3) Build the EvaluationCard (+ optional TOST vs a baseline).
++python scripts/03_make_report.py --exp E2_corpus_adv --baseline E0_acoustic_only
++```
++
++## Tests
++
++The model/training logic is verified without external data:
++
++```bash
++pip install -r requirements.txt
++pytest -q
++```
++
++> **External data note.** DAIC-WOZ / E-DAIC / EATD / Androids corpora and the
++> frozen backbones (XLS-R, XLM-R) are **not** distributed here. Feature
++> extraction (`scripts/01`) is guarded so it degrades gracefully (missing
++> modalities are masked, never imputed). Places needing the actual corpora are
++> marked with `TODO(external-data)`.
+diff --git a/TransValDep_Design.md b/TransValDep_Design.md
+new file mode 100644
+index 0000000..50fdc0b
+--- /dev/null
++++ b/TransValDep_Design.md
+@@ -0,0 +1,638 @@
++# TransVal-Dep: Thiết kế & Blueprint Code
++
++**Một benchmark đa-corpus, kiểm soát confound, calibration-first cho phát hiện trầm cảm từ phỏng vấn lâm sàng**
++
++> Tài liệu này là bản thiết kế kỹ thuật đầy đủ (design doc + code blueprint) để hiện thực hoá hướng nghiên cứu mới phát triển từ bài *"A Leakage-Free Reassessment of Multimodal Depression Detection"*. Mục tiêu: viết được code ngay. Mọi module đều có đặc tả input/output, shape tensor, và ý tưởng code PyTorch cụ thể.
++
++---
++
++## 0. Tóm tắt một trang
++
++| Mục | Nội dung |
++|---|---|
++| **Tên dự án** | TransVal-Dep (Transferable-Validity Depression detection) |
++| **Câu hỏi NC** | Dấu hiệu trầm cảm nào *thực sự là của trầm cảm* (không phải distress chung) và *thực sự chuyển giao được* giữa corpus/ngôn ngữ? |
++| **Đóng góp chính** | (1) Benchmark transferable-validity; (2) Đánh giá kiểm soát confound; (3) Học biểu diễn bất biến (adversarial + Group-DRO); (4) Calibration-first + selective prediction; (5) Thống kê đủ power + TOST. |
++| **Bỏ khỏi bài cũ** | CUAF context-adaptive fusion, BCM "Bioenergy", reliability=1−entropy. |
++| **Giữ & nâng cấp** | Leakage-free participant-level CV, calibration, phát hiện acoustic-dominance (thành giả thuyết). |
++| **Dữ liệu** | DAIC-WOZ / E-DAIC (EN) + EATD (ZH) + Androids (IT); tùy chọn CMDC/MODMA. |
++| **Metric** | AUC, confound-conditioned AUC, specificity-gap, ECE, Brier, risk–coverage AUC, TOST equivalence. |
++| **Venue** | IEEE TAC / Interspeech / EMNLP (resources & evaluation) / Pattern Recognition. |
++
++---
++
++## 1. Năm tính mới (đặc tả để hiện thực hoá)
++
++### NV1 — Transferable-Validity Benchmark
++Giao thức đánh giá chuẩn hoá: đa corpus, **participant-level leakage-free**, calibration trên train-fold, confound-stratification. Đóng gói thành "evaluation card" + code release.
++- *Hiện thực:* lớp `LeakageFreeSplitter` + `EvaluationCard` (mục 6, 9).
++- *Xoá hạn chế:* dữ liệu nhỏ (gộp corpus), external validity, không artifact.
++
++### NV2 — Đánh giá kiểm soát confound (đóng góp đinh)
++Partial-out giới tính, tuổi, độ dài phỏng vấn, comorbidity (PTSD/lo âu nếu có). Báo cáo **confound-conditioned AUC** và **specificity-gap** = AUC(depression) − AUC(distress-proxy).
++- *Hiện thực:* `ConfoundEvaluator` (mục 8.3), `partial_auc_by_group`, residualization của logit theo confound.
++- *Xoá hạn chế:* lỗ hổng validity ([13]), gender bias (Bailey & Plumbley).
++
++### NV3 — Học biểu diễn bất biến / khử bias (thay CUAF/BCM)
++Shared depression head + **adversary corpus/gender** qua Gradient Reversal (DANN) + **Group-DRO** (tối ưu nhóm khó nhất). Tuỳ chọn **IRM penalty**.
++- *Hiện thực:* `GradientReversal`, `DomainAdversary`, `GroupDROLoss`, `irm_penalty` (mục 5.4–5.6).
++- *Xoá hạn chế:* kiến trúc chết + reliability yếu.
++
++### NV4 — Calibration-first + Selective Prediction
++Isotonic/Platt trên train-fold; selective head với ngưỡng abstain. Báo cáo risk–coverage, ECE, Brier, decision-curve.
++- *Hiện thực:* `ProbabilityCalibrator`, `SelectivePredictor`, `risk_coverage_curve` (mục 5.7, 8.4).
++- *Xoá hạn chế:* bẫy F1-một-ngưỡng trên N nhỏ.
++
++### NV5 — Thống kê đủ power + pre-registration
++Multi-seed ≥5; participant-level bootstrap CI; **TOST equivalence** trong biên ε; giả thuyết pre-registered.
++- *Hiện thực:* `bootstrap_ci`, `tost_equivalence`, `aggregate_seeds` (mục 8.5).
++- *Xoá hạn chế:* "n=5 fold không kết luận được".
++
++### (Tái sử dụng) Question-wise segmentation → **validity probe**
++Không điều khiển fusion nữa; dùng để đo *câu hỏi nào* mang tín hiệu chuyển giao được & bền confound.
++
++---
++
++## 2. Cấu trúc repository
++
++```
++transval-dep/
++├── configs/
++│   ├── default.yaml            # siêu tham số gốc
++│   ├── corpora.yaml            # đường dẫn + schema từng corpus
++│   └── experiments/            # 1 file/thí nghiệm (ablation)
++├── data/
++│   ├── raw/                    # corpus gốc (read-only)
++│   ├── interim/                # segment + feature cache (.pt / .npy)
++│   └── manifests/              # CSV: participant_id, label, gender, age, corpus, split...
++├── src/
++│   ├── data/
++│   │   ├── segmentation.py     # cắt theo prompt, lọc <3s / >60s
++│   │   ├── features.py         # wav2vec2 / HuBERT, BERT, COVAREP, CLNF
++│   │   ├── confounds.py        # trích & chuẩn hoá metadata confound
++│   │   ├── dataset.py          # SegmentDataset, collate, bag aggregation
++│   │   └── splitter.py         # LeakageFreeSplitter (participant-level)
++│   ├── models/
++│   │   ├── encoders.py         # ModalityEncoder, AttentionPool
++│   │   ├── grl.py              # GradientReversal
++│   │   ├── adversary.py        # DomainAdversary (corpus/gender)
++│   │   ├── heads.py            # DepressionHead, SelectiveHead
++│   │   └── transval_net.py     # kiến trúc tổng hợp
++│   ├── losses/
++│   │   ├── group_dro.py        # GroupDROLoss
++│   │   ├── irm.py              # irm_penalty
++│   │   └── consistency.py      # (tuỳ chọn) intermodal KL
++│   ├── calibration/
++│   │   ├── calibrators.py      # Platt, Isotonic
++│   │   └── selective.py        # SelectivePredictor, risk-coverage
++│   ├── train/
++│   │   ├── trainer.py          # vòng huấn luyện + adversarial schedule
++│   │   └── cv_runner.py        # 5-fold × multi-seed orchestrator
++│   ├── eval/
++│   │   ├── metrics.py          # auc, ece, brier, f1, partial_auc
++│   │   ├── confound_eval.py    # ConfoundEvaluator, specificity-gap
++│   │   ├── stats.py            # bootstrap_ci, tost_equivalence
++│   │   └── probe.py            # question-type validity probe
++│   └── utils/                  # seed, logging, registry
++├── scripts/
++│   ├── 00_build_manifests.py
++│   ├── 01_extract_features.py
++│   ├── 02_run_cv.py
++│   └── 03_make_report.py
++└── tests/                      # unit test cho splitter, GRL, calibrator
++```
++
++---
++
++## 3. Xử lý dữ liệu (chi tiết)
++
++### 3.1 Lược đồ corpus thống nhất (`corpora.yaml`)
++Mọi corpus được map về một schema chung để code không phụ thuộc corpus:
++
++```yaml
++daic_woz:
++  language: en
++  audio_dir: data/raw/daic/{pid}/{pid}_AUDIO.wav
++  transcript: data/raw/daic/{pid}/{pid}_TRANSCRIPT.csv
++  prompts_speaker: "Ellie"          # tên người phỏng vấn để cắt segment
++  label_csv: data/raw/daic/labels.csv  # cột: Participant_ID, PHQ8_Binary, PHQ8_Score, Gender
++  acoustic: data/raw/daic/{pid}/{pid}_COVAREP.csv
++  visual:   data/raw/daic/{pid}/{pid}_CLNF_AUs.txt
++eatd:
++  language: zh
++  audio_dir: data/raw/eatd/{pid}/*.wav
++  label_csv: data/raw/eatd/labels.csv
++  prompts_speaker: null              # EATD không có cấu trúc Ellie → segment theo VAD
++androids:
++  language: it
++  audio_dir: data/raw/androids/{pid}/interview.wav
++  label_csv: data/raw/androids/labels.csv
++  prompts_speaker: null
++```
++
++### 3.2 Manifest cấp participant (`data/manifests/all.csv`)
++Một dòng / participant. **Đây là đơn vị split** (chống leakage).
++
++| cột | kiểu | ý nghĩa |
++|---|---|---|
++| `participant_id` | str | duy nhất toàn cục: `daic_303`, `eatd_12` |
++| `corpus` | str | daic / eatd / androids |
++| `language` | str | en / zh / it |
++| `label` | int | 0/1 (ngưỡng PHQ-8 ≥ 10 hoặc tương đương của corpus) |
++| `severity` | float | PHQ-8/SDS score nếu có (cho phân tích phụ) |
++| `gender` | int | 0/1 (confound) |
++| `age` | float | nếu có (confound) |
++| `interview_len_s` | float | confound (độ dài) |
++| `comorbidity_ptsd` | int | nếu có (E-DAIC) |
++| `n_segments` | int | điền sau khi segment |
++
++> **Quy tắc nhãn nghiêm ngặt:** nhãn là *cấp participant*. Segment **chỉ là instance**, không gán nhãn cứng — xem MIL/bag ở 3.5.
++
++### 3.3 Segmentation (`segmentation.py`)
++- **Có prompt (DAIC):** cắt mỗi đoạn trả lời giữa hai prompt liên tiếp của Ellie; gắn `question_type` từ prompt trước đó qua một bảng ánh xạ `prompt2qtype.yaml` (greeting/background/family/mood/sleep/work/stress/therapy/other). **Bảng ánh xạ phải công khai và versioned** (đây là điểm bài cũ thiếu).
++- **Không prompt (EATD/Androids):** dùng VAD (silero-vad) cắt theo turn; `question_type = "unknown"`.
++- Lọc: bỏ segment < 3s, cắt cap 60s.
++
++**I/O:**
++```
++input : audio_path (wav 16kHz), transcript_df, prompt_map
++output: List[Segment] với Segment = {
++          seg_id, participant_id, start_s, end_s,
++          question_type, audio_slice_path | (offset,dur)
++        }
++```
++
++### 3.4 Trích đặc trưng (`features.py`)
++Cache ra `.pt` để không tính lại. **Mỗi modality là một nhánh độc lập** (acoustic là nhánh mạnh nhất theo phát hiện cũ → là baseline bắt buộc).
++
++| Modality | Backbone | Output / segment |
++|---|---|---|
++| `audio` | wav2vec2 / HuBERT (frozen, đa ngôn ngữ: dùng `wav2vec2-xlsr` cho cross-lingual) | `(T_a, 1024)` chuỗi frame |
++| `acoustic` | COVAREP+FORMANT chuẩn hoá z-score | `(T_c, 79)` |
++| `text` | BERT/RoBERTa multilingual (frozen) `[CLS]` | `(768,)` |
++| `visual` | CLNF AUs+gaze+pose | `(T_v, 50)` (chỉ DAIC; corpus khác → mask) |
++
++> **Cross-lingual lưu ý:** dùng backbone đa ngôn ngữ (XLS-R cho audio, XLM-R cho text). Modality thiếu (vd visual ở EATD) → **modality-mask** trong collate, không impute bừa.
++
++**I/O của một segment sau feature:**
++```python
++seg_feat = {
++  "audio":    Tensor(T_a, 1024),   # hoặc None → mask
++  "acoustic": Tensor(T_c, 79),
++  "text":     Tensor(768),
++  "visual":   Tensor(T_v, 50) | None,
++  "qtype":    int,                 # id question_type
++  "meta": {"participant_id","corpus","gender","language"}
++}
++```
++
++### 3.5 Bag (MIL) cấp participant — sửa label-noise của bài cũ
++Thay vì gán nhãn session cho từng segment rồi train (gây nhiễu), ta dùng **Multiple-Instance Learning**: participant = bag, segment = instance, nhãn ở **bag**.
++
++```
++Bag = {
++  segments: List[seg_feat],      # số lượng thay đổi
++  label: int,                    # bag-level
++  group_id: int                  # (corpus,gender) → cho Group-DRO
++}
++```
++Aggregation từ segment → participant dùng **attention pooling học được** (mục 5.3), KHÔNG dùng mean cứng.
++
++### 3.6 Collate (`dataset.py`)
++Batch theo **bag** (participant) để loss bag-level đúng. Pad chuỗi frame trong từng modality, tạo `attention_mask`, và `modality_mask` (1 nếu modality tồn tại).
++
++```python
++def collate_bags(bags):
++    # gom segment của nhiều bag, ghi lại chỉ số bag để pool lại
++    return {
++      "audio":        pad_sequence(...),      # (N_seg, T_max, 1024)
++      "audio_mask":   BoolTensor(N_seg,T_max),
++      "acoustic":     ...,
++      "text":         Tensor(N_seg, 768),
++      "visual":       ...,
++      "modality_mask":Tensor(N_seg, 4),       # tồn tại modality nào
++      "seg2bag":      LongTensor(N_seg),       # mỗi segment thuộc bag nào
++      "bag_labels":   LongTensor(B),
++      "group_ids":    LongTensor(B),
++      "corpus_ids":   LongTensor(N_seg),
++      "gender_ids":   LongTensor(N_seg),
++      "qtypes":       LongTensor(N_seg),
++    }
++```
++
++---
++
++## 4. Kiến trúc tổng thể
++
++```
++                 ┌─────────── per-segment ───────────┐
++ audio (T,1024)─▶│ AudioEncoder  → e_a (d)            │
++ acoustic(T,79)─▶│ AcousticEncoder→ e_c (d)           │
++ text (768)─────▶│ TextEncoder   → e_t (d)            │
++ visual(T,50)──▶ │ VisualEncoder → e_v (d) [maskable] │
++                 └──────────────┬────────────────────┘
++                                │ concat + modality-mask
++                          z_seg = FuseMLP([e_a,e_c,e_t,e_v]) (d)
++                                │
++        ┌───────────────────────┼───────────────────────────┐
++        │                       │                           │
++   DepHead(seg)          AttentionPool(seg→bag)        GRL → DomainAdversary
++   logit_seg                 z_bag (d)                 (corpus_id, gender_id)
++                                │
++                          DepHead(bag) → logit_bag ──▶ calibrate ──▶ p_bag
++                                │
++                          SelectiveHead → g_bag (abstain gate)
++```
++
++Hai cấp dự đoán: **segment** (phụ trợ, cho probe & regularize) và **bag** (chính). Adversary gắn ở `z_seg` để khử thông tin corpus/gender khỏi biểu diễn.
++
++---
++
++## 5. Đặc tả & blueprint từng module
++
++### 5.1 AttentionPool (segment-frame → vector)
++```python
++class AttentionPool(nn.Module):
++    """Gộp chuỗi frame (T,d_in) → vector (d_out) bằng attention có mask."""
++    def __init__(self, d_in, d_out):
++        super().__init__()
++        self.proj = nn.Linear(d_in, d_out)
++        self.attn = nn.Linear(d_out, 1)
++    def forward(self, x, mask):           # x:(N,T,d_in) mask:(N,T) bool
++        h = torch.tanh(self.proj(x))      # (N,T,d_out)
++        a = self.attn(h).squeeze(-1)      # (N,T)
++        a = a.masked_fill(~mask, -1e4)
++        w = torch.softmax(a, dim=1).unsqueeze(-1)  # (N,T,1)
++        return (w * h).sum(1)             # (N,d_out)
++```
++
++### 5.2 ModalityEncoder (mỗi modality một bản)
++```python
++class ModalityEncoder(nn.Module):
++    """
++    audio/acoustic/visual: BiLSTM + AttentionPool (chuỗi → d)
++    text: MLP ([CLS] → d)
++    input : (N,T,F) + mask  | hoặc (N,F) cho text
++    output: e (N, d)
++    """
++    def __init__(self, in_dim, d, seq=True):
++        super().__init__()
++        self.seq = seq
++        if seq:
++            self.rnn  = nn.LSTM(in_dim, d//2, batch_first=True, bidirectional=True)
++            self.pool = AttentionPool(d, d)
++        else:
++            self.mlp = nn.Sequential(nn.Linear(in_dim,d), nn.GELU(), nn.LayerNorm(d))
++    def forward(self, x, mask=None):
++        if self.seq:
++            h,_ = self.rnn(x)             # (N,T,d)
++            return self.pool(h, mask)     # (N,d)
++        return self.mlp(x)               # (N,d)
++```
++
++### 5.3 Fusion + Bag pooling
++- **FuseMLP:** nối 4 embedding (đã nhân `modality_mask` để zero modality thiếu) → MLP → `z_seg (N_seg,d)`. *Lưu ý:* đây là fusion **tĩnh, đơn giản** — KHÔNG context-adaptive (đã chứng minh vô ích). Mọi novelty nằm ở invariance + calibration, không ở fusion.
++- **Bag AttentionPool:** gộp các `z_seg` cùng `seg2bag` → `z_bag (B,d)` (attention học được, thay mean cứng của bài cũ).
++
++```python
++def pool_segments_to_bags(z_seg, seg2bag, B, attn):
++    # attn: Linear(d,1). Pool có mask theo bag.
++    scores = attn(z_seg).squeeze(-1)            # (N_seg,)
++    z_bag = z_seg.new_zeros(B, z_seg.size(1))
++    for b in range(B):                          # vectorise bằng scatter_softmax khi tối ưu
++        idx = (seg2bag == b)
++        w = torch.softmax(scores[idx], 0).unsqueeze(-1)
++        z_bag[b] = (w * z_seg[idx]).sum(0)
++    return z_bag
++```
++> Khi tối ưu tốc độ: thay vòng for bằng `torch_scatter.scatter_softmax`.
++
++### 5.4 GradientReversal (lõi của NV3)
++```python
++class _GradRev(torch.autograd.Function):
++    @staticmethod
++    def forward(ctx, x, lambd):
++        ctx.lambd = lambd; return x.view_as(x)
++    @staticmethod
++    def backward(ctx, g):
++        return -ctx.lambd * g, None          # đảo dấu gradient
++
++class GradientReversal(nn.Module):
++    def __init__(self, lambd=1.0): super().__init__(); self.lambd=lambd
++    def forward(self, x): return _GradRev.apply(x, self.lambd)
++```
++`lambd` tăng dần theo lịch huấn luyện: `λ = 2/(1+exp(-γ·p)) − 1`, `p` ∈ [0,1] tiến trình.
++
++### 5.5 DomainAdversary (corpus & gender)
++```python
++class DomainAdversary(nn.Module):
++    """Dự đoán corpus_id và gender_id từ z_seg SAU GRL → ép z_seg quên chúng."""
++    def __init__(self, d, n_corpus, n_gender=2, lambd=1.0):
++        super().__init__()
++        self.grl = GradientReversal(lambd)
++        self.corpus_clf = nn.Sequential(nn.Linear(d,d), nn.GELU(), nn.Linear(d,n_corpus))
++        self.gender_clf = nn.Sequential(nn.Linear(d,d), nn.GELU(), nn.Linear(d,n_gender))
++    def forward(self, z):
++        z = self.grl(z)
++        return self.corpus_clf(z), self.gender_clf(z)   # (N,n_corpus),(N,n_gender)
++```
++Loss adversary = CE(corpus) + CE(gender). Vì GRL đảo dấu, tối thiểu hoá loss này khiến encoder *xoá* thông tin corpus/gender.
++
++### 5.6 Group-DRO + IRM (NV3, tuỳ chọn)
++```python
++class GroupDROLoss(nn.Module):
++    """Tối ưu nhóm có loss cao nhất (vd nam-trầm-cảm). group_ids∈[0,G)."""
++    def __init__(self, n_groups, step=0.01):
++        super().__init__(); self.q = torch.ones(n_groups)/n_groups; self.step=step
++    def forward(self, per_sample_loss, group_ids):
++        G = self.q.numel()
++        g_loss = torch.stack([per_sample_loss[group_ids==g].mean()
++                              if (group_ids==g).any() else per_sample_loss.new_zeros(())
++                              for g in range(G)])
++        self.q = (self.q.to(g_loss) * torch.exp(self.step*g_loss.detach()))
++        self.q = self.q/self.q.sum()
++        return (self.q * g_loss).sum()
++
++def irm_penalty(logits, y, dummy_w):           # dummy_w = torch.tensor(1., requires_grad=True)
++    loss = F.binary_cross_entropy_with_logits(logits*dummy_w, y.float())
++    g = torch.autograd.grad(loss, dummy_w, create_graph=True)[0]
++    return g.pow(2).sum()                       # cộng vào tổng loss với hệ số nhỏ
++```
++
++### 5.7 Heads: Depression + Selective + Calibrator
++```python
++class DepressionHead(nn.Module):
++    def __init__(self,d): super().__init__(); self.fc=nn.Linear(d,1)
++    def forward(self,z): return self.fc(z).squeeze(-1)        # logit (B,)
++
++class SelectiveHead(nn.Module):
++    """g∈[0,1]: 1=dự đoán, 0=abstain. Huấn luyện kèm phạt coverage."""
++    def __init__(self,d): super().__init__(); self.fc=nn.Linear(d,1)
++    def forward(self,z): return torch.sigmoid(self.fc(z)).squeeze(-1)
++```
++Calibration **không** học trong mạng — fit *sau* khi train, **chỉ trên train-fold** (mục 7):
++```python
++class ProbabilityCalibrator:
++    def __init__(self, method="isotonic"): self.method=method; self.model=None
++    def fit(self, logits, y):
++        p = 1/(1+np.exp(-logits))
++        if self.method=="platt":
++            self.model = LogisticRegression().fit(logits.reshape(-1,1), y)
++        else:
++            self.model = IsotonicRegression(out_of_bounds="clip").fit(p, y)
++        return self
++    def transform(self, logits):
++        p = 1/(1+np.exp(-logits))
++        return (self.model.predict_proba(logits.reshape(-1,1))[:,1]
++                if self.method=="platt" else self.model.predict(p))
++```
++
++### 5.8 TransValNet (lắp ráp)
++```python
++class TransValNet(nn.Module):
++    def __init__(self, d=128, n_corpus=3, use_adv=True, use_visual=True):
++        super().__init__()
++        self.enc = nn.ModuleDict({
++          "audio":    ModalityEncoder(1024,d,seq=True),
++          "acoustic": ModalityEncoder(79,  d,seq=True),
++          "text":     ModalityEncoder(768, d,seq=False),
++          "visual":   ModalityEncoder(50,  d,seq=True),
++        })
++        self.fuse   = nn.Sequential(nn.Linear(4*d,d), nn.GELU(), nn.LayerNorm(d))
++        self.bag_attn = nn.Linear(d,1)
++        self.dep_seg = DepressionHead(d)
++        self.dep_bag = DepressionHead(d)
++        self.selective = SelectiveHead(d)
++        self.adv = DomainAdversary(d, n_corpus) if use_adv else None
++
++    def forward(self, batch):
++        e = []
++        for m in ["audio","acoustic","text","visual"]:
++            x = batch[m]
++            if m=="text": emb = self.enc[m](x)
++            else:         emb = self.enc[m](x, batch[m+"_mask"])
++            e.append(emb)
++        E = torch.stack(e,1) * batch["modality_mask"].unsqueeze(-1)  # zero modality thiếu
++        z_seg = self.fuse(E.flatten(1))                              # (N_seg,d)
++        z_bag = pool_segments_to_bags(z_seg, batch["seg2bag"],
++                                      batch["bag_labels"].size(0), self.bag_attn)
++        out = {
++          "logit_bag": self.dep_bag(z_bag),
++          "logit_seg": self.dep_seg(z_seg),
++          "gate_bag":  self.selective(z_bag),
++          "z_seg": z_seg, "z_bag": z_bag,
++        }
++        if self.adv is not None:
++            out["corpus_logit"], out["gender_logit"] = self.adv(z_seg)
++        return out
++```
++
++---
++
++## 6. Leakage-free splitter (NV1)
++
++```python
++class LeakageFreeSplitter:
++    """
++    5-fold participant-level, stratified theo (label, corpus).
++    Đảm bảo: không participant nào ở >1 fold; calibrator/threshold
++    chỉ fit trên train-fold; mỗi participant được predict đúng 1 lần.
++    """
++    def __init__(self, manifest_df, n_folds=5, seed=0):
++        self.df=manifest_df; self.k=n_folds; self.seed=seed
++    def folds(self):
++        # khoá stratify = label*10 + corpus_id  (giữ tỉ lệ dương & corpus mỗi fold)
++        skf = StratifiedKFold(self.k, shuffle=True, random_state=self.seed)
++        key = self.df["label"]*10 + self.df["corpus_id"]
++        for tr, te in skf.split(self.df, key):
++            yield self.df.iloc[tr]["participant_id"].tolist(), \
++                  self.df.iloc[te]["participant_id"].tolist()
++```
++> **Hai chế độ đánh giá** trong cùng splitter: (a) *pooled CV* (gộp corpus) cho power; (b) *leave-one-corpus-out* (LOCO) cho transfer thực sự — train trên 2 corpus, test corpus thứ 3. LOCO là phép thử transfer mạnh nhất.
++
++---
++
++## 7. Quy trình Training (`trainer.py`)
++
++### 7.1 Tổng loss
++```
++L = L_dep_bag                         # BCE bag-level (chính)
++  + α · L_dep_seg                     # BCE segment phụ trợ (regularize)
++  + β · L_adv (corpus+gender, qua GRL)  # NV3 bất biến
++  + γ · L_irm                         # NV3 tuỳ chọn
++  + δ · L_consistency                 # tuỳ chọn (KL intermodal) — mặc định 0
++```
++- `L_dep_bag` dùng **Group-DRO** thay vì BCE thường khi `use_group_dro=True`.
++- Class imbalance: `pos_weight` trong BCE **hoặc** Group-DRO (không chồng cả hai để tránh méo probability trước calibration).
++
++### 7.2 Lịch huấn luyện
++```python
++for epoch in range(E):
++    p = epoch/E
++    lambd = 2/(1+math.exp(-10*p)) - 1            # warmup adversary
++    model.adv.grl.lambd = lambd
++    for batch in train_loader:
++        out = model(batch)
++        per_sample = F.binary_cross_entropy_with_logits(
++            out["logit_bag"], batch["bag_labels"].float(), reduction="none")
++        L_dep = (group_dro(per_sample, batch["group_ids"])
++                 if cfg.use_group_dro else per_sample.mean())
++        L_seg = F.binary_cross_entropy_with_logits(
++            out["logit_seg"], gather_seg_labels(batch), reduction="mean")  # nhãn bag broadcast cho seg CHỈ ở loss phụ
++        L_adv = (F.cross_entropy(out["corpus_logit"], batch["corpus_ids"])
++               + F.cross_entropy(out["gender_logit"], batch["gender_ids"]))
++        L = L_dep + cfg.alpha*L_seg + cfg.beta*L_adv
++        if cfg.use_irm:
++            L = L + cfg.gamma*irm_penalty(out["logit_bag"], batch["bag_labels"], dummy_w)
++        opt.zero_grad(); L.backward(); clip_grad_norm_(model.parameters(),1.0); opt.step()
++    # early stopping theo AUC trên một held-out *trong train-fold* (inner split)
++```
++> **Backbone đông cứng** (wav2vec2/BERT) → chỉ train encoder nhẹ + heads + adversary.
++
++### 7.3 Calibration sau train (chỉ train-fold)
++Sau khi train xong mỗi fold: lấy logit của **inner-validation thuộc train-fold**, fit `ProbabilityCalibrator` + chọn ngưỡng (mặc định 0.5 sau isotonic; hoặc Youden trên inner-val). **Tuyệt đối không** chạm test-fold.
++
++### 7.4 Multi-seed (NV5)
++Mỗi fold chạy `seeds = [0,1,2,3,4]`. Lưu mọi prediction. CI cuối cùng phản ánh **cả** fold-variance lẫn seed-variance (sửa lỗi bài cũ).
++
++---
++
++## 8. Quy trình Testing & Đánh giá
++
++### 8.1 Suy luận trên test-fold
++Với mỗi participant test: forward → `logit_bag` → calibrator(train-fold) → `p_bag` → ngưỡng(train-fold) → nhãn. Mỗi participant predict đúng 1 lần.
++
++### 8.2 Metric cơ bản (`metrics.py`)
++- AUC-ROC (threshold-independent — **primary**), F1/Precision/Recall (ở ngưỡng đã transfer), **Specificity & Sensitivity** (bài cũ hứa nhưng thiếu — phải có).
++- **ECE** (calibration error), **Brier score**.
++
++### 8.3 ConfoundEvaluator (NV2 — đóng góp đinh)
++```python
++class ConfoundEvaluator:
++    """
++    1) AUC theo từng nhóm confound (gender/corpus/độ dài-binned).
++    2) Residualized AUC: hồi quy logit theo confound, đánh giá phần dư.
++    3) specificity_gap = AUC(depression) − AUC(distress_proxy)
++       distress_proxy: nhãn 'có distress' (PTSD/anxiety/score cao nhưng dưới ngưỡng dep)
++    """
++    def partial_auc_by_group(self, y, p, group):
++        return {g: roc_auc_score(y[group==g], p[group==g]) for g in np.unique(group)}
++    def residualized_auc(self, y, logit, C):    # C: ma trận confound (gender,age,len...)
++        r = logit - LinearRegression().fit(C, logit).predict(C)
++        return roc_auc_score(y, r)
++    def specificity_gap(self, y_dep, y_distress, p):
++        return roc_auc_score(y_dep, p) - roc_auc_score(y_distress, p)
++```
++**Câu chuyện:** nếu AUC sụt mạnh sau residualization, hoặc specificity_gap ≈ 0 → mô hình bắt distress/confound chứ không phải trầm cảm. Nếu invariance (NV3) giữ được AUC sau residualization → bằng chứng học được tín hiệu *thật*.
++
++### 8.4 Selective prediction (NV4)
++```python
++def risk_coverage_curve(y, p, gate):
++    order = np.argsort(-gate)                  # ưu tiên giữ ca tự tin
++    cov, risk = [], []
++    for k in range(1, len(order)+1):
++        idx = order[:k]
++        yhat = (p[idx] >= 0.5).astype(int)
++        cov.append(k/len(order))
++        risk.append(1 - f1_score(y[idx], yhat))   # risk = 1−F1 (hoặc error)
++    return np.array(cov), np.array(risk)         # báo cáo AURC = area dưới đường
++```
++Báo cáo **AURC** và F1 tại coverage 70%/50% (triage thực tế). Decision-curve analysis cho ngưỡng lâm sàng.
++
++### 8.5 Thống kê (NV5)
++```python
++def bootstrap_ci(y, p, metric=roc_auc_score, n=2000, level=0.95):
++    rng=np.random.default_rng(0); vals=[]
++    idx0=np.arange(len(y))
++    for _ in range(n):
++        s=rng.choice(idx0, len(idx0), replace=True)   # bootstrap CẤP PARTICIPANT
++        try: vals.append(metric(y[s], p[s]))
++        except ValueError: pass
++    lo,hi=np.percentile(vals,[(1-level)/2*100,(1+level)/2*100])
++    return float(np.mean(vals)), (float(lo),float(hi))
++
++def tost_equivalence(diffs, eps):
++    """diffs: chênh lệch metric A−B qua các fold×seed. H0: |Δ|≥eps. Reject→tương đương."""
++    m,sd,n = diffs.mean(), diffs.std(ddof=1), len(diffs)
++    se = sd/np.sqrt(n)
++    t_low  = (m - (-eps))/se;  p_low  = 1 - t.cdf(t_low, n-1)
++    t_high = (eps - m)/se;     p_high = 1 - t.cdf(t_high, n-1)
++    return max(p_low, p_high)   # < 0.05 ⇒ kết luận TƯƠNG ĐƯƠNG (không chỉ "không khác")
++```
++> Đây là khác biệt sống còn với bài cũ: thay vì "p>0.05 nên không kết luận", ta **chứng minh tương đương trong biên ε** (ε pre-registered, vd ε_AUC=0.03).
++
++### 8.6 Question-type validity probe (`probe.py`)
++Dùng `logit_seg` nhóm theo `question_type` × corpus: đo AUC từng loại câu hỏi, kiểm tra loại nào **chuyển giao** (AUC ổn định giữa corpus) và **bền confound** (AUC giữ sau residualization). Kết quả: bảng question_type × {AUC_in, AUC_transfer, AUC_residualized}. Đây là phần "hồi sinh" segmentation theo hướng có giá trị.
++
++---
++
++## 9. Ma trận thí nghiệm (ablation)
++
++| Exp | Mô tả | Kiểm chứng |
++|---|---|---|
++| E0 | **Acoustic-only** + calibration (baseline bắt buộc) | tham chiếu — mọi thứ phải vượt mốc này |
++| E1 | Full fusion, **không** adversary, không Group-DRO | baseline multimodal |
++| E2 | E1 + **corpus-adversary** (NV3) | transfer cải thiện? |
++| E3 | E2 + **gender-adversary** | confound gender giảm? |
++| E4 | E3 + **Group-DRO** | nhóm khó cải thiện? |
++| E5 | E4 + **IRM** | bất biến mạnh hơn? |
++| E6 | Best + **selective prediction** | AURC, F1@coverage |
++| LOCO | Best dưới leave-one-corpus-out | transfer thật |
++| PROBE | question-type validity | câu hỏi nào mang tín hiệu thật |
++
++Mỗi exp: 5 fold × 5 seed; báo cáo mean + bootstrap CI; mọi so sánh kèm **TOST**. Mọi exp đều report confound-conditioned AUC + specificity-gap.
++
++---
++
++## 10. Config mẫu (`configs/default.yaml`)
++
++```yaml
++model:  {d: 128, use_adv: true, use_group_dro: true, use_irm: false, use_visual: true}
++loss:   {alpha: 0.3, beta: 0.5, gamma: 0.1, delta: 0.0, pos_weight: 2.0}
++train:  {epochs: 40, lr: 1.0e-3, batch_bags: 8, patience: 10, grad_clip: 1.0}
++cv:     {n_folds: 5, seeds: [0,1,2,3,4], mode: pooled}   # pooled | loco
++calib:  {method: isotonic, threshold: youden_inner}
++stats:  {eps_auc: 0.03, eps_f1: 0.05, bootstrap_n: 2000}
++backbones: {audio: facebook/wav2vec2-xls-r-300m, text: xlm-roberta-base}
++```
++
++---
++
++## 11. Pre-registration (viết TRƯỚC khi chạy)
++
++1. **H1 (transfer):** corpus-adversary cải thiện LOCO-AUC so với E1, Δ>ε.
++2. **H2 (validity):** specificity-gap của model bất biến > 0 và > model baseline.
++3. **H3 (fairness):** gender-adversary thu hẹp |AUC_nam − AUC_nữ|.
++4. **H_equiv:** nếu fusion không vượt acoustic-only (E0), kết luận **tương đương** qua TOST (ε_AUC=0.03) — biến negative thành phát biểu thống kê hợp lệ.
++5. Khoá ε, số seed, số fold, metric chính **trước** khi xem test.
++
++---
++
++## 12. Checklist tái lập (artifact — bài cũ thiếu)
++
++- [ ] Release code + `prompt2qtype.yaml` versioned.
++- [ ] Lưu danh sách participant từng fold/seed (`splits/`).
++- [ ] Lưu mọi prediction (`preds/{exp}/{fold}_{seed}.parquet`).
++- [ ] Bảng hyperparameter đầy đủ + lệnh chạy.
++- [ ] Báo cáo cả pooled-CV và LOCO; cả 3 ngưỡng (transferred/calibrated/oracle).
++- [ ] Multi-seed CI (không chỉ fold-variance).
++
++---
++
++## 13. Lộ trình hiện thực (gợi ý thứ tự code)
++
++1. `splitter.py` + `tests/test_splitter.py` (đảm bảo leakage-free trước tiên).
++2. `segmentation.py` + `features.py` + cache (chạy `01_extract_features.py`).
++3. `dataset.py` + `collate_bags` (kiểm tra shape bằng 1 batch nhỏ).
++4. `encoders.py` → `transval_net.py` (forward chạy được với batch giả).
++5. `grl.py` + `adversary.py` + `group_dro.py` (unit test gradient đảo dấu).
++6. `trainer.py` E0→E1 (acoustic-only rồi fusion).
++7. `calibration/` + `selective.py`.
++8. `eval/` (metrics → confound_eval → stats → probe).
++9. `cv_runner.py` ráp 5-fold × multi-seed.
++10. `03_make_report.py` xuất EvaluationCard + bảng ablation.
++
++---
++
++### Ghi chú cuối
++Mọi novelty của bài nằm ở **invariance + confound-control + calibration + thống kê đủ power**, KHÔNG ở fusion. Giữ fusion đơn giản có chủ đích để câu chuyện sạch: "chúng tôi đo tính hợp lệ chuyển giao được, và cho thấy điều gì thật sự sống sót". Đó là thứ khiến bài publishable bất kể kết quả dương hay âm.
+diff --git a/configs/corpora.yaml b/configs/corpora.yaml
+new file mode 100644
+index 0000000..a989eac
+--- /dev/null
++++ b/configs/corpora.yaml
+@@ -0,0 +1,34 @@
++# Unified corpus schema. Every corpus is mapped to a common layout so the code
++# is corpus-agnostic. {pid} is substituted with the participant id.
++daic_woz:
++  corpus: daic
++  language: en
++  audio_dir: data/raw/daic/{pid}/{pid}_AUDIO.wav
++  transcript: data/raw/daic/{pid}/{pid}_TRANSCRIPT.csv
++  prompts_speaker: Ellie            # interviewer name used to cut segments
++  label_csv: data/raw/daic/labels.csv   # Participant_ID, PHQ8_Binary, PHQ8_Score, Gender
++  acoustic: data/raw/daic/{pid}/{pid}_COVAREP.csv
++  visual: data/raw/daic/{pid}/{pid}_CLNF_AUs.txt
++  label_threshold: 10               # PHQ-8 >= 10 -> positive
++
++eatd:
++  corpus: eatd
++  language: zh
++  audio_dir: data/raw/eatd/{pid}/*.wav
++  transcript: null
++  prompts_speaker: null             # no Ellie structure -> VAD segmentation
++  label_csv: data/raw/eatd/labels.csv
++  acoustic: null
++  visual: null
++  label_threshold: 53               # SDS index threshold (corpus convention)
++
++androids:
++  corpus: androids
++  language: it
++  audio_dir: data/raw/androids/{pid}/interview.wav
++  transcript: null
++  prompts_speaker: null
++  label_csv: data/raw/androids/labels.csv
++  acoustic: null
++  visual: null
++  label_threshold: null             # corpus provides binary labels directly
+diff --git a/configs/default.yaml b/configs/default.yaml
+new file mode 100644
+index 0000000..eb2b451
+--- /dev/null
++++ b/configs/default.yaml
+@@ -0,0 +1,47 @@
++# TransVal-Dep base hyper-parameters (source-of-truth = TransValDep_Design.md §10).
++model:
++  d: 128
++  use_adv: true
++  use_group_dro: true
++  use_irm: false
++  use_visual: true
++  n_corpus: 3
++  n_gender: 2
++
++loss:
++  alpha: 0.3        # segment auxiliary BCE weight
++  beta: 0.5         # corpus+gender adversary weight (via GRL)
++  gamma: 0.1        # IRM penalty weight
++  delta: 0.0        # intermodal consistency (off by default)
++  pos_weight: 2.0   # BCE positive class weight
++
++train:
++  epochs: 40
++  lr: 1.0e-3
++  batch_bags: 8
++  patience: 10
++  grad_clip: 1.0
++  weight_decay: 1.0e-5
++  grl_gamma: 10.0
++  device: cpu
++
++cv:
++  n_folds: 5
++  seeds: [0, 1, 2, 3, 4]
++  mode: pooled        # pooled | loco
++  inner_val_frac: 0.2
++  out_dir: outputs
++  exp_name: default
++
++calib:
++  method: isotonic            # isotonic | platt
++  threshold: youden_inner     # youden_inner | fixed
++
++stats:
++  eps_auc: 0.03
++  eps_f1: 0.05
++  bootstrap_n: 2000
++
++backbones:
++  audio: facebook/wav2vec2-xls-r-300m
++  text: xlm-roberta-base
+diff --git a/configs/experiments/E0_acoustic_only.yaml b/configs/experiments/E0_acoustic_only.yaml
+new file mode 100644
+index 0000000..d9c7abf
+--- /dev/null
++++ b/configs/experiments/E0_acoustic_only.yaml
+@@ -0,0 +1,12 @@
++# E0: Acoustic-only + calibration. Mandatory baseline everything must beat.
++model:
++  use_adv: false
++  use_group_dro: false
++  use_visual: false
++loss:
++  alpha: 0.0
++  beta: 0.0
++cv:
++  exp_name: E0_acoustic_only
++# NOTE: drive single-modality behaviour by feeding only the acoustic branch in
++# the bag_provider (mask audio/text/visual). See scripts/02_run_cv.py.
+diff --git a/configs/experiments/E1_full_fusion.yaml b/configs/experiments/E1_full_fusion.yaml
+new file mode 100644
+index 0000000..8377ef3
+--- /dev/null
++++ b/configs/experiments/E1_full_fusion.yaml
+@@ -0,0 +1,8 @@
++# E1: Full fusion, no adversary, no Group-DRO. Multimodal baseline.
++model:
++  use_adv: false
++  use_group_dro: false
++loss:
++  beta: 0.0
++cv:
++  exp_name: E1_full_fusion
+diff --git a/configs/experiments/E2_corpus_adv.yaml b/configs/experiments/E2_corpus_adv.yaml
+new file mode 100644
+index 0000000..03c470a
+--- /dev/null
++++ b/configs/experiments/E2_corpus_adv.yaml
+@@ -0,0 +1,10 @@
++# E2: E1 + corpus-adversary (NV3). Tests whether transfer improves.
++model:
++  use_adv: true
++  use_group_dro: false
++loss:
++  beta: 0.5
++cv:
++  exp_name: E2_corpus_adv
++# Gender-adversary head is present but its target can be neutralised by setting
++# beta_gender weighting in the trainer if a corpus-only ablation is desired.
+diff --git a/configs/experiments/E4_group_dro.yaml b/configs/experiments/E4_group_dro.yaml
+new file mode 100644
+index 0000000..c9dac20
+--- /dev/null
++++ b/configs/experiments/E4_group_dro.yaml
+@@ -0,0 +1,8 @@
++# E4: E3 + Group-DRO. Tests whether the hardest group improves.
++model:
++  use_adv: true
++  use_group_dro: true
++loss:
++  beta: 0.5
++cv:
++  exp_name: E4_group_dro
+diff --git a/configs/experiments/E5_irm.yaml b/configs/experiments/E5_irm.yaml
+new file mode 100644
+index 0000000..06f56fd
+--- /dev/null
++++ b/configs/experiments/E5_irm.yaml
+@@ -0,0 +1,10 @@
++# E5: E4 + IRM penalty. Tests stronger invariance.
++model:
++  use_adv: true
++  use_group_dro: true
++  use_irm: true
++loss:
++  beta: 0.5
++  gamma: 0.1
++cv:
++  exp_name: E5_irm
+diff --git a/configs/experiments/LOCO_best.yaml b/configs/experiments/LOCO_best.yaml
+new file mode 100644
+index 0000000..08c3030
+--- /dev/null
++++ b/configs/experiments/LOCO_best.yaml
+@@ -0,0 +1,10 @@
++# LOCO: best configuration under leave-one-corpus-out (true transfer test).
++model:
++  use_adv: true
++  use_group_dro: true
++  use_irm: false
++loss:
++  beta: 0.5
++cv:
++  mode: loco
++  exp_name: LOCO_best
+diff --git a/configs/prompt2qtype.yaml b/configs/prompt2qtype.yaml
+new file mode 100644
+index 0000000..51d09a7
+--- /dev/null
++++ b/configs/prompt2qtype.yaml
+@@ -0,0 +1,14 @@
++# Versioned, public prompt -> question_type mapping (blueprint §3.3).
++# Keys are case-insensitive regex/substring patterns matched against the
++# interviewer prompt; the first match wins. Falls back to "other".
++version: 1
++
++mapping:
++  "hi|hello|how are you|nice to meet": greeting
++  "where are you from|where do you live|tell me about yourself|your hometown": background
++  "family|parents|kids|children|married|siblings": family
++  "feeling|mood|happy|sad|depressed|down|how have you been feeling": mood
++  "sleep|sleeping|rest|tired|insomnia|nightmares": sleep
++  "work|job|study|school|career|employed": work
++  "stress|stressed|argument|conflict|difficult|pressure|overwhelmed": stress
++  "therapy|diagnos|treatment|counsel|psycholog|medication|ptsd": therapy
+diff --git a/data/manifests/.gitkeep b/data/manifests/.gitkeep
+new file mode 100644
+index 0000000..e69de29
+diff --git a/pyproject.toml b/pyproject.toml
+new file mode 100644
+index 0000000..6d6bd7e
+--- /dev/null
++++ b/pyproject.toml
+@@ -0,0 +1,27 @@
++[build-system]
++requires = ["setuptools>=61.0"]
++build-backend = "setuptools.build_meta"
++
++[project]
++name = "transval-dep"
++version = "0.1.0"
++description = "Transferable-Validity Depression detection: a multi-corpus, confound-controlled, calibration-first benchmark."
++requires-python = ">=3.9"
++dependencies = [
++    "numpy>=1.23",
++    "pandas>=1.5",
++    "scipy>=1.9",
++    "scikit-learn>=1.2",
++    "torch>=2.0",
++    "PyYAML>=6.0",
++]
++
++[project.optional-dependencies]
++features = ["transformers>=4.30", "torchaudio>=2.0", "silero-vad>=5.0", "pyarrow>=12.0"]
++dev = ["pytest>=7.0"]
++
++[tool.setuptools.packages.find]
++include = ["src*"]
++
++[tool.pytest.ini_options]
++testpaths = ["tests"]
+diff --git a/requirements.txt b/requirements.txt
+new file mode 100644
+index 0000000..a82d2bf
+--- /dev/null
++++ b/requirements.txt
+@@ -0,0 +1,12 @@
++numpy>=1.23
++pandas>=1.5
++scipy>=1.9
++scikit-learn>=1.2
++torch>=2.0
++PyYAML>=6.0
++# Optional / external-data dependencies (feature extraction & VAD):
++# transformers>=4.30
++# torchaudio>=2.0
++# silero-vad>=5.0
++# pyarrow>=12.0   # for parquet prediction dumps
++pytest>=7.0
+diff --git a/scripts/00_build_manifests.py b/scripts/00_build_manifests.py
+new file mode 100644
+index 0000000..2ca089d
+--- /dev/null
++++ b/scripts/00_build_manifests.py
+@@ -0,0 +1,118 @@
++#!/usr/bin/env python
++"""Build the participant-level manifest from per-corpus label files.
++
++Reads ``configs/corpora.yaml`` and each corpus' ``label_csv`` to produce a
++unified ``data/manifests/all.csv`` whose one-row-per-participant schema is the
++unit of leakage-free splitting.
++
++Usage:
++    python scripts/00_build_manifests.py \
++        --corpora configs/corpora.yaml --out data/manifests/all.csv
++"""
++
++from __future__ import annotations
++
++import argparse
++import sys
++from pathlib import Path
++
++import pandas as pd
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++
++from src.data.splitter import add_corpus_id  # noqa: E402
++from src.utils.config import load_config  # noqa: E402
++from src.utils.logging import get_logger  # noqa: E402
++
++logger = get_logger("build_manifests")
++
++# Heuristic column name candidates per corpus label file.
++ID_CANDIDATES = ["Participant_ID", "participant_id", "id", "pid"]
++LABEL_CANDIDATES = ["PHQ8_Binary", "label", "binary", "Depression"]
++SCORE_CANDIDATES = ["PHQ8_Score", "SDS", "severity", "score"]
++GENDER_CANDIDATES = ["Gender", "gender", "sex"]
++
++
++def _pick(df: pd.DataFrame, candidates) -> str:
++    for c in candidates:
++        if c in df.columns:
++            return c
++    return ""
++
++
++def build_for_corpus(name: str, spec) -> pd.DataFrame:
++    """Build manifest rows for a single corpus from its label CSV.
++
++    Args:
++        name: Corpus key in corpora.yaml.
++        spec: Corpus spec (Config).
++
++    Returns:
++        DataFrame with the unified manifest columns for this corpus.
++    """
++    label_csv = Path(spec["label_csv"])
++    if not label_csv.exists():
++        # TODO(external-data): corpus label files are not distributed with the
++        # code. Provide them under data/raw/ then re-run this script.
++        logger.warning("Label file missing for %s: %s (skipping)", name, label_csv)
++        return pd.DataFrame()
++
++    raw = pd.read_csv(label_csv)
++    id_col = _pick(raw, ID_CANDIDATES)
++    label_col = _pick(raw, LABEL_CANDIDATES)
++    if not id_col or not label_col:
++        logger.warning("Could not find id/label columns for %s; columns=%s", name, list(raw.columns))
++        return pd.DataFrame()
++
++    corpus = spec.get("corpus", name)
++    score_col = _pick(raw, SCORE_CANDIDATES)
++    gender_col = _pick(raw, GENDER_CANDIDATES)
++
++    out = pd.DataFrame()
++    out["participant_id"] = corpus + "_" + raw[id_col].astype(str)
++    out["corpus"] = corpus
++    out["language"] = spec.get("language", "unknown")
++    out["label"] = raw[label_col].astype(int)
++    out["severity"] = raw[score_col].astype(float) if score_col else float("nan")
++    out["gender"] = raw[gender_col].astype(int) if gender_col else 0
++    out["age"] = raw["age"].astype(float) if "age" in raw.columns else float("nan")
++    out["interview_len_s"] = (
++        raw["interview_len_s"].astype(float) if "interview_len_s" in raw.columns else float("nan")
++    )
++    out["comorbidity_ptsd"] = (
++        raw["PTSD"].astype(int) if "PTSD" in raw.columns else 0
++    )
++    out["n_segments"] = 0
++    return out
++
++
++def main() -> None:
++    ap = argparse.ArgumentParser(description=__doc__)
++    ap.add_argument("--corpora", default="configs/corpora.yaml")
++    ap.add_argument("--out", default="data/manifests/all.csv")
++    args = ap.parse_args()
++
++    corpora = load_config(args.corpora)
++    frames = [build_for_corpus(name, spec) for name, spec in corpora.items()]
++    frames = [f for f in frames if not f.empty]
++
++    if not frames:
++        logger.error("No corpus produced rows. Add label files under data/raw/.")
++        # Still emit an empty, correctly-typed manifest so downstream imports work.
++        cols = [
++            "participant_id", "corpus", "language", "label", "severity",
++            "gender", "age", "interview_len_s", "comorbidity_ptsd", "n_segments",
++        ]
++        manifest = pd.DataFrame(columns=cols)
++    else:
++        manifest = pd.concat(frames, ignore_index=True)
++        manifest = add_corpus_id(manifest)
++
++    out = Path(args.out)
++    out.parent.mkdir(parents=True, exist_ok=True)
++    manifest.to_csv(out, index=False)
++    logger.info("Wrote %d participants to %s", len(manifest), out)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/scripts/01_extract_features.py b/scripts/01_extract_features.py
+new file mode 100644
+index 0000000..8392006
+--- /dev/null
++++ b/scripts/01_extract_features.py
+@@ -0,0 +1,181 @@
++#!/usr/bin/env python
++"""Segment interviews, extract per-modality features and cache them.
++
++For every participant in the manifest this:
++
++1. segments the interview (prompt-based for DAIC, VAD fallback otherwise);
++2. extracts audio/text/acoustic/visual features per segment;
++3. caches a feature dict per segment under ``data/interim/features/``;
++4. writes a segment-level manifest ``data/manifests/segments.csv``.
++
++Usage:
++    python scripts/01_extract_features.py \
++        --manifest data/manifests/all.csv --corpora configs/corpora.yaml
++"""
++
++from __future__ import annotations
++
++import argparse
++import sys
++from pathlib import Path
++from typing import Dict, List
++
++import pandas as pd
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++
++from src.data.features import (  # noqa: E402
++    AudioFeatureExtractor,
++    FeatureCache,
++    TextFeatureExtractor,
++    build_segment_feature,
++    load_acoustic_csv,
++    load_visual_txt,
++)
++from src.data.segmentation import Segment, segment_participant  # noqa: E402
++from src.utils.config import load_config  # noqa: E402
++from src.utils.logging import get_logger  # noqa: E402
++
++logger = get_logger("extract_features")
++
++
++def _load_prompt_map(path: str = "configs/prompt2qtype.yaml") -> Dict[str, str]:
++    cfg = load_config(path)
++    mapping = cfg.get("mapping", {})
++    return {k: v for k, v in (mapping.to_dict() if hasattr(mapping, "to_dict") else mapping).items()}
++
++
++def _resolve(template: str, pid_local: str) -> str:
++    return template.replace("{pid}", pid_local)
++
++
++def process_participant(
++    row: pd.Series,
++    spec,
++    prompt_map: Dict[str, str],
++    cache: FeatureCache,
++    audio_fx: AudioFeatureExtractor,
++    text_fx: TextFeatureExtractor,
++    extract_audio: bool,
++) -> List[Dict[str, object]]:
++    """Segment + feature-extract a single participant. Returns segment rows.
++
++    Heavy backbone inference is guarded so the pipeline still runs end-to-end on
++    machines without GPU/model weights (those modalities are cached as ``None``
++    and masked downstream).
++    """
++    pid = row["participant_id"]
++    pid_local = pid.split("_", 1)[1] if "_" in pid else pid
++    corpus = row["corpus"]
++
++    audio_path = _resolve(str(spec.get("audio_dir", "")), pid_local) or None
++    transcript_path = spec.get("transcript")
++    transcript_df = None
++    if transcript_path:
++        tp = Path(_resolve(str(transcript_path), pid_local))
++        if tp.exists():
++            transcript_df = pd.read_csv(tp, sep="\t" if tp.suffix == ".csv" else ",")
++
++    try:
++        segments: List[Segment] = segment_participant(
++            participant_id=pid,
++            audio_path=audio_path if (audio_path and Path(audio_path).exists()) else None,
++            transcript_df=transcript_df,
++            prompt_map=prompt_map,
++            prompts_speaker=spec.get("prompts_speaker"),
++        )
++    except Exception as exc:  # pragma: no cover - depends on external data
++        logger.warning("Segmentation failed for %s: %s", pid, exc)
++        return []
++
++    acoustic_path = spec.get("acoustic")
++    visual_path = spec.get("visual")
++    rows: List[Dict[str, object]] = []
++
++    for seg in segments:
++        audio_arr = acoustic_arr = visual_arr = text_arr = None
++
++        if acoustic_path:
++            ap = Path(_resolve(str(acoustic_path), pid_local))
++            if ap.exists():
++                acoustic_arr = load_acoustic_csv(ap, seg.start_s, seg.end_s)
++        if visual_path:
++            vp = Path(_resolve(str(visual_path), pid_local))
++            if vp.exists():
++                visual_arr = load_visual_txt(vp, seg.start_s, seg.end_s)
++        if seg.text:
++            try:
++                text_arr = text_fx.extract(seg.text)
++            except Exception as exc:  # pragma: no cover - external model
++                logger.debug("Text features skipped for %s: %s", seg.seg_id, exc)
++        if extract_audio:
++            # TODO(external-data): requires waveform slicing + model weights.
++            logger.debug("Audio extraction enabled but slicing is corpus-specific.")
++
++        feat = build_segment_feature(
++            seg, corpus=corpus, gender=int(row.get("gender", 0)),
++            language=row.get("language", "unknown"),
++            audio_arr=audio_arr, acoustic_arr=acoustic_arr,
++            visual_arr=visual_arr, text_arr=text_arr,
++        )
++        cache.save(seg.seg_id, feat)
++        rows.append(
++            {
++                "participant_id": pid,
++                "seg_id": seg.seg_id,
++                "qtype": seg.qtype_id,
++                "start_s": seg.start_s,
++                "end_s": seg.end_s,
++            }
++        )
++    return rows
++
++
++def main() -> None:
++    ap = argparse.ArgumentParser(description=__doc__)
++    ap.add_argument("--manifest", default="data/manifests/all.csv")
++    ap.add_argument("--corpora", default="configs/corpora.yaml")
++    ap.add_argument("--cache_dir", default="data/interim/features")
++    ap.add_argument("--segments_out", default="data/manifests/segments.csv")
++    ap.add_argument("--config", default="configs/default.yaml")
++    ap.add_argument("--extract_audio", action="store_true",
++                    help="Run the (heavy) audio backbone; off by default.")
++    args = ap.parse_args()
++
++    manifest = pd.read_csv(args.manifest)
++    corpora = load_config(args.corpora)
++    cfg = load_config(args.config)
++    prompt_map = _load_prompt_map()
++    cache = FeatureCache(args.cache_dir)
++
++    audio_fx = AudioFeatureExtractor(model_name=cfg.backbones.audio)
++    text_fx = TextFeatureExtractor(model_name=cfg.backbones.text)
++
++    # Map corpus name -> spec.
++    spec_by_corpus = {spec.get("corpus", name): spec for name, spec in corpora.items()}
++
++    all_segment_rows: List[Dict[str, object]] = []
++    seg_counts: Dict[str, int] = {}
++    for _, row in manifest.iterrows():
++        spec = spec_by_corpus.get(row["corpus"])
++        if spec is None:
++            logger.warning("No corpus spec for %s", row["corpus"])
++            continue
++        rows = process_participant(
++            row, spec, prompt_map, cache, audio_fx, text_fx, args.extract_audio
++        )
++        all_segment_rows.extend(rows)
++        seg_counts[row["participant_id"]] = len(rows)
++
++    seg_df = pd.DataFrame(all_segment_rows)
++    Path(args.segments_out).parent.mkdir(parents=True, exist_ok=True)
++    seg_df.to_csv(args.segments_out, index=False)
++
++    # Update n_segments in the participant manifest.
++    manifest["n_segments"] = manifest["participant_id"].map(seg_counts).fillna(0).astype(int)
++    manifest.to_csv(args.manifest, index=False)
++    logger.info("Cached %d segments for %d participants", len(seg_df), len(manifest))
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/scripts/02_run_cv.py b/scripts/02_run_cv.py
+new file mode 100644
+index 0000000..48a56c9
+--- /dev/null
++++ b/scripts/02_run_cv.py
+@@ -0,0 +1,143 @@
++#!/usr/bin/env python
++"""Run multi-seed cross-validation for one experiment.
++
++Merges ``configs/default.yaml`` with an optional experiment override, builds a
++:class:`BagBuilder` over the cached features and runs :class:`CVRunner`.
++
++Usage:
++    python scripts/02_run_cv.py --experiment configs/experiments/E2_corpus_adv.yaml
++"""
++
++from __future__ import annotations
++
++import argparse
++import json
++import sys
++from pathlib import Path
++from typing import Dict
++
++import pandas as pd
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++
++from src.data.bag_builder import BagBuilder  # noqa: E402
++from src.data.features import FeatureCache, MODALITIES  # noqa: E402
++from src.models.transval_net import TransValNet  # noqa: E402
++from src.train.cv_runner import CVConfig, CVRunner  # noqa: E402
++from src.train.trainer import TrainerConfig  # noqa: E402
++from src.utils.config import load_config  # noqa: E402
++from src.utils.logging import get_logger  # noqa: E402
++
++logger = get_logger("run_cv")
++
++
++def _deep_merge(base: Dict, override: Dict) -> Dict:
++    """Recursively merge ``override`` into ``base`` (returns a new dict)."""
++    out = dict(base)
++    for k, v in override.items():
++        if isinstance(v, dict) and isinstance(out.get(k), dict):
++            out[k] = _deep_merge(out[k], v)
++        else:
++            out[k] = v
++    return out
++
++
++def build_configs(cfg) -> (TrainerConfig, CVConfig):
++    trainer_cfg = TrainerConfig(
++        epochs=cfg.train.epochs,
++        lr=float(cfg.train.lr),
++        grad_clip=cfg.train.grad_clip,
++        patience=cfg.train.patience,
++        alpha=cfg.loss.alpha,
++        beta=cfg.loss.beta,
++        gamma=cfg.loss.gamma,
++        delta=cfg.loss.delta,
++        pos_weight=cfg.loss.pos_weight,
++        use_group_dro=cfg.model.use_group_dro,
++        use_irm=cfg.model.use_irm,
++        grl_gamma=cfg.train.grl_gamma,
++        weight_decay=float(cfg.train.weight_decay),
++        device=cfg.train.device,
++        calib_method=cfg.calib.method,
++        threshold_strategy=cfg.calib.threshold,
++    )
++    cv_cfg = CVConfig(
++        n_folds=cfg.cv.n_folds,
++        seeds=list(cfg.cv.seeds),
++        mode=cfg.cv.mode,
++        batch_bags=cfg.train.batch_bags,
++        inner_val_frac=cfg.cv.inner_val_frac,
++        out_dir=cfg.cv.out_dir,
++        exp_name=cfg.cv.exp_name,
++    )
++    return trainer_cfg, cv_cfg
++
++
++def main() -> None:
++    ap = argparse.ArgumentParser(description=__doc__)
++    ap.add_argument("--config", default="configs/default.yaml")
++    ap.add_argument("--experiment", default=None)
++    ap.add_argument("--manifest", default="data/manifests/all.csv")
++    ap.add_argument("--segments", default="data/manifests/segments.csv")
++    ap.add_argument("--cache_dir", default="data/interim/features")
++    ap.add_argument("--modalities", default=None,
++                    help="Comma-separated modality subset, e.g. 'acoustic' for E0.")
++    args = ap.parse_args()
++
++    base = load_config(args.config).to_dict()
++    if args.experiment:
++        override = load_config(args.experiment).to_dict()
++        merged = _deep_merge(base, override)
++    else:
++        merged = base
++    from src.utils.config import Config
++
++    cfg = Config(merged)
++
++    manifest = pd.read_csv(args.manifest)
++    segments = pd.read_csv(args.segments)
++    cache = FeatureCache(args.cache_dir)
++
++    modalities = (
++        [m.strip() for m in args.modalities.split(",")] if args.modalities else None
++    )
++    if cfg.cv.exp_name.startswith("E0") and modalities is None:
++        modalities = ["acoustic"]  # acoustic-only baseline
++
++    builder = BagBuilder(manifest, segments, cache, modalities=modalities)
++    n_groups = builder.n_groups()
++    n_corpus = int(builder.manifest["corpus_id"].max()) + 1
++
++    def model_factory() -> TransValNet:
++        return TransValNet(
++            d=cfg.model.d,
++            n_corpus=n_corpus,
++            n_gender=cfg.model.n_gender,
++            use_adv=cfg.model.use_adv,
++            use_visual=cfg.model.use_visual,
++        )
++
++    trainer_cfg, cv_cfg = build_configs(cfg)
++    runner = CVRunner(
++        manifest_df=manifest,
++        bag_provider=builder.build,
++        model_factory=model_factory,
++        trainer_cfg=trainer_cfg,
++        cv_cfg=cv_cfg,
++        n_groups=n_groups,
++    )
++    result = runner.run()
++
++    out_dir = Path(cfg.cv.out_dir)
++    out_dir.mkdir(parents=True, exist_ok=True)
++    summary_path = out_dir / f"{cfg.cv.exp_name}_summary.json"
++    with open(summary_path, "w", encoding="utf-8") as fh:
++        json.dump(result["aggregate"], fh, indent=2)
++    logger.info("Wrote summary to %s", summary_path)
++    for metric, stats in result["aggregate"].items():
++        logger.info("  %-14s mean=%.4f std=%.4f (n=%d)",
++                    metric, stats["mean"], stats["std"], stats["n"])
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/scripts/03_make_report.py b/scripts/03_make_report.py
+new file mode 100644
+index 0000000..381e45b
+--- /dev/null
++++ b/scripts/03_make_report.py
+@@ -0,0 +1,163 @@
++#!/usr/bin/env python
++"""Aggregate predictions into an EvaluationCard + ablation/confound report.
++
++Loads per-fold/seed prediction files for one experiment, computes the primary
++metric suite with participant-level bootstrap CIs, the confound-conditioned
++report, and (optionally) a TOST equivalence test against a second experiment.
++
++Usage:
++    python scripts/03_make_report.py --exp E2_corpus_adv \
++        --baseline E0_acoustic_only --manifest data/manifests/all.csv
++"""
++
++from __future__ import annotations
++
++import argparse
++import json
++import sys
++from pathlib import Path
++from typing import Dict, List, Optional
++
++import numpy as np
++import pandas as pd
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++
++from src.data.confounds import ConfoundExtractor, length_bins  # noqa: E402
++from src.eval.confound_eval import ConfoundEvaluator  # noqa: E402
++from src.eval.metrics import compute_all_metrics, roc_auc  # noqa: E402
++from src.eval.stats import bootstrap_ci, tost_equivalence  # noqa: E402
++from src.utils.config import load_config  # noqa: E402
++from src.utils.logging import get_logger  # noqa: E402
++
++logger = get_logger("make_report")
++
++
++def load_preds(exp: str, out_dir: str) -> pd.DataFrame:
++    """Load and concatenate all prediction files for an experiment."""
++    pred_dir = Path(out_dir) / "preds" / exp
++    frames: List[pd.DataFrame] = []
++    for f in sorted(pred_dir.glob("*.parquet")):
++        frames.append(pd.read_parquet(f))
++    for f in sorted(pred_dir.glob("*.csv")):
++        frames.append(pd.read_csv(f))
++    if not frames:
++        raise FileNotFoundError(f"No predictions found under {pred_dir}")
++    return pd.concat(frames, ignore_index=True)
++
++
++def per_run_auc(preds: pd.DataFrame) -> Dict[tuple, float]:
++    """AUC per (fold, seed) run, for TOST paired differences."""
++    out = {}
++    for (fold, seed), grp in preds.groupby(["fold", "seed"]):
++        out[(int(fold), int(seed))] = roc_auc(grp["label"].to_numpy(), grp["prob"].to_numpy())
++    return out
++
++
++def main() -> None:
++    ap = argparse.ArgumentParser(description=__doc__)
++    ap.add_argument("--exp", required=True)
++    ap.add_argument("--baseline", default=None, help="Experiment to TOST against.")
++    ap.add_argument("--manifest", default="data/manifests/all.csv")
++    ap.add_argument("--config", default="configs/default.yaml")
++    ap.add_argument("--out_dir", default="outputs")
++    ap.add_argument("--report_out", default=None)
++    args = ap.parse_args()
++
++    cfg = load_config(args.config)
++    preds = load_preds(args.exp, args.out_dir)
++    manifest = pd.read_csv(args.manifest)
++
++    # Pool predictions across seeds by averaging per participant (then evaluate).
++    pooled = preds.groupby("participant_id").agg(
++        label=("label", "first"),
++        prob=("prob", "mean"),
++        logit=("logit", "mean"),
++        gate=("gate", "mean"),
++    ).reset_index()
++    merged = pooled.merge(manifest, on="participant_id", how="left", suffixes=("", "_m"))
++
++    y = merged["label"].to_numpy()
++    p = merged["prob"].to_numpy()
++    logit = merged["logit"].to_numpy()
++
++    metrics = compute_all_metrics(y, p, threshold=0.5)
++    auc_mean, (auc_lo, auc_hi) = bootstrap_ci(y, p, n=cfg.stats.bootstrap_n)
++
++    # Confound report.
++    conf = ConfoundEvaluator()
++    C = ConfoundExtractor().fit_transform(merged)
++    groups: Dict[str, np.ndarray] = {}
++    if "gender" in merged:
++        groups["gender"] = merged["gender"].fillna(0).astype(int).to_numpy()
++    if "corpus_id" in merged:
++        groups["corpus"] = merged["corpus_id"].fillna(0).astype(int).to_numpy()
++    elif "corpus" in merged:
++        groups["corpus"] = pd.factorize(merged["corpus"])[0]
++    if "interview_len_s" in merged:
++        groups["length"] = length_bins(merged["interview_len_s"].to_numpy())
++    confound_report = conf.evaluate(y, p, logit, C, groups)
++
++    # TOST equivalence vs baseline (paired per fold x seed AUC differences).
++    tost_p: Optional[float] = None
++    if args.baseline:
++        base_preds = load_preds(args.baseline, args.out_dir)
++        a, b = per_run_auc(preds), per_run_auc(base_preds)
++        diffs = [a[k] - b[k] for k in a if k in b and not (np.isnan(a[k]) or np.isnan(b[k]))]
++        if diffs:
++            tost_p = tost_equivalence(diffs, eps=cfg.stats.eps_auc)
++
++    card = {
++        "experiment": args.exp,
++        "n_participants": int(len(merged)),
++        "metrics": metrics,
++        "auc_bootstrap": {"mean": auc_mean, "ci95": [auc_lo, auc_hi]},
++        "confound_report": confound_report,
++        "tost_vs_baseline": (
++            {"baseline": args.baseline, "eps_auc": cfg.stats.eps_auc, "p": tost_p}
++            if args.baseline else None
++        ),
++    }
++
++    out_dir = Path(args.out_dir)
++    json_path = out_dir / f"{args.exp}_card.json"
++    with open(json_path, "w", encoding="utf-8") as fh:
++        json.dump(card, fh, indent=2, default=float)
++
++    md_path = Path(args.report_out) if args.report_out else out_dir / f"{args.exp}_card.md"
++    _write_markdown(card, md_path)
++    logger.info("EvaluationCard written: %s / %s", json_path, md_path)
++
++
++def _write_markdown(card: Dict, path: Path) -> None:
++    lines = [f"# EvaluationCard — {card['experiment']}", ""]
++    lines.append(f"- Participants: **{card['n_participants']}**")
++    m = card["metrics"]
++    ab = card["auc_bootstrap"]
++    lines.append(
++        f"- AUC: **{m['auc']:.3f}** "
++        f"(bootstrap mean {ab['mean']:.3f}, 95% CI [{ab['ci95'][0]:.3f}, {ab['ci95'][1]:.3f}])"
++    )
++    lines.append(f"- Partial AUC: {m['partial_auc']:.3f} | ECE: {m['ece']:.3f} | Brier: {m['brier']:.3f}")
++    lines.append(
++        f"- Sensitivity: {m['sensitivity']:.3f} | Specificity: {m['specificity']:.3f} | F1: {m['f1']:.3f}"
++    )
++    cr = card["confound_report"]
++    lines += ["", "## Confound report", ""]
++    lines.append(f"- Residualized AUC: {cr.get('residualized_auc', float('nan')):.3f}")
++    for key, val in cr.items():
++        if key.startswith("auc_by_"):
++            pretty = ", ".join(f"{g}:{v:.3f}" for g, v in val.items())
++            lines.append(f"- {key}: {pretty}")
++    if card.get("tost_vs_baseline"):
++        t = card["tost_vs_baseline"]
++        verdict = "EQUIVALENT" if (t["p"] is not None and t["p"] < 0.05) else "not equivalent"
++        lines += ["", "## TOST equivalence", ""]
++        lines.append(
++            f"- vs `{t['baseline']}` (eps={t['eps_auc']}): p={t['p']} -> **{verdict}**"
++        )
++    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/src/__init__.py b/src/__init__.py
+new file mode 100644
+index 0000000..71c54b1
+--- /dev/null
++++ b/src/__init__.py
+@@ -0,0 +1,7 @@
++"""TransVal-Dep: Transferable-Validity Depression detection.
++
++A multi-corpus, confound-controlled, calibration-first benchmark for
++depression detection from clinical interviews.
++"""
++
++__version__ = "0.1.0"
+diff --git a/src/calibration/__init__.py b/src/calibration/__init__.py
+new file mode 100644
+index 0000000..83344d5
+--- /dev/null
++++ b/src/calibration/__init__.py
+@@ -0,0 +1,12 @@
++"""Probability calibration and selective prediction (NV4)."""
++
++from .calibrators import ProbabilityCalibrator, choose_threshold
++from .selective import SelectivePredictor, risk_coverage_curve, aurc
++
++__all__ = [
++    "ProbabilityCalibrator",
++    "choose_threshold",
++    "SelectivePredictor",
++    "risk_coverage_curve",
++    "aurc",
++]
+diff --git a/src/calibration/calibrators.py b/src/calibration/calibrators.py
+new file mode 100644
+index 0000000..d7e9e4b
+--- /dev/null
++++ b/src/calibration/calibrators.py
+@@ -0,0 +1,87 @@
++"""Post-hoc probability calibration (Platt / Isotonic), fit on train-fold only.
++
++Calibration is never learned inside the network. After a fold is trained, the
++calibrator is fit on the *inner-validation* logits (a held-out slice of the
++training fold) and applied to the test fold. The test fold is never touched
++during fitting.
++"""
++
++from __future__ import annotations
++
++from typing import Tuple
++
++import numpy as np
++
++
++def _sigmoid(logits: np.ndarray) -> np.ndarray:
++    return 1.0 / (1.0 + np.exp(-np.asarray(logits, dtype=np.float64)))
++
++
++class ProbabilityCalibrator:
++    """Platt scaling or isotonic regression calibrator.
++
++    Args:
++        method: ``"platt"`` (logistic on logits) or ``"isotonic"`` (monotone on
++            probabilities).
++    """
++
++    def __init__(self, method: str = "isotonic") -> None:
++        if method not in {"platt", "isotonic"}:
++            raise ValueError(f"Unknown calibration method '{method}'")
++        self.method = method
++        self.model = None
++
++    def fit(self, logits: np.ndarray, y: np.ndarray) -> "ProbabilityCalibrator":
++        """Fit on uncalibrated logits and binary labels (train-fold only)."""
++        from sklearn.isotonic import IsotonicRegression
++        from sklearn.linear_model import LogisticRegression
++
++        logits = np.asarray(logits, dtype=np.float64).reshape(-1)
++        y = np.asarray(y).reshape(-1)
++        if self.method == "platt":
++            self.model = LogisticRegression(C=1e6, solver="lbfgs").fit(
++                logits.reshape(-1, 1), y
++            )
++        else:
++            p = _sigmoid(logits)
++            self.model = IsotonicRegression(out_of_bounds="clip").fit(p, y)
++        return self
++
++    def transform(self, logits: np.ndarray) -> np.ndarray:
++        """Map logits -> calibrated probabilities in ``[0, 1]``."""
++        if self.model is None:
++            raise RuntimeError("Calibrator must be fit before transform().")
++        logits = np.asarray(logits, dtype=np.float64).reshape(-1)
++        if self.method == "platt":
++            return self.model.predict_proba(logits.reshape(-1, 1))[:, 1]
++        return self.model.predict(_sigmoid(logits))
++
++    def fit_transform(self, logits: np.ndarray, y: np.ndarray) -> np.ndarray:
++        return self.fit(logits, y).transform(logits)
++
++
++def choose_threshold(
++    y: np.ndarray, p: np.ndarray, strategy: str = "youden_inner"
++) -> float:
++    """Select a decision threshold on inner-validation probabilities.
++
++    Args:
++        y: Binary labels.
++        p: Calibrated probabilities.
++        strategy: ``"youden_inner"`` (maximise sensitivity+specificity-1) or
++            ``"fixed"`` (return ``0.5``).
++
++    Returns:
++        Chosen probability threshold.
++    """
++    if strategy == "fixed":
++        return 0.5
++    from sklearn.metrics import roc_curve
++
++    y = np.asarray(y).reshape(-1)
++    p = np.asarray(p, dtype=np.float64).reshape(-1)
++    if len(np.unique(y)) < 2:
++        return 0.5
++    fpr, tpr, thr = roc_curve(y, p)
++    youden = tpr - fpr
++    return float(thr[int(np.argmax(youden))])
+diff --git a/src/calibration/selective.py b/src/calibration/selective.py
+new file mode 100644
+index 0000000..6a5360e
+--- /dev/null
++++ b/src/calibration/selective.py
+@@ -0,0 +1,98 @@
++"""Selective prediction: risk-coverage analysis and an abstain wrapper (NV4)."""
++
++from __future__ import annotations
++
++from typing import Tuple
++
++import numpy as np
++from sklearn.metrics import f1_score
++
++
++def risk_coverage_curve(
++    y: np.ndarray, p: np.ndarray, gate: np.ndarray, threshold: float = 0.5
++) -> Tuple[np.ndarray, np.ndarray]:
++    """Compute the risk-coverage curve.
++
++    Cases are admitted in decreasing order of the selective ``gate`` (most
++    confident first). At each coverage level the risk is ``1 - F1`` over the
++    admitted set.
++
++    Args:
++        y: Binary labels.
++        p: Calibrated probabilities.
++        gate: Selective gate values (higher = more confident to predict).
++        threshold: Decision threshold for ``p``.
++
++    Returns:
++        Tuple ``(coverage, risk)`` arrays.
++    """
++    y = np.asarray(y).reshape(-1)
++    p = np.asarray(p, dtype=np.float64).reshape(-1)
++    gate = np.asarray(gate, dtype=np.float64).reshape(-1)
++    order = np.argsort(-gate)
++    n = len(order)
++    cov, risk = [], []
++    for k in range(1, n + 1):
++        idx = order[:k]
++        yhat = (p[idx] >= threshold).astype(int)
++        cov.append(k / n)
++        if len(np.unique(y[idx])) < 2:
++            # F1 undefined with a single class present; treat risk as error rate.
++            risk.append(float((yhat != y[idx]).mean()))
++        else:
++            risk.append(1.0 - f1_score(y[idx], yhat))
++    return np.asarray(cov), np.asarray(risk)
++
++
++def aurc(coverage: np.ndarray, risk: np.ndarray) -> float:
++    """Area under the risk-coverage curve (lower is better)."""
++    coverage = np.asarray(coverage, dtype=np.float64)
++    risk = np.asarray(risk, dtype=np.float64)
++    if len(coverage) < 2:
++        return float(risk.mean()) if len(risk) else 0.0
++    # np.trapezoid (NumPy>=2.0) with a fallback to the legacy np.trapz name.
++    trapezoid = np.trapezoid if hasattr(np, "trapezoid") else np.trapz
++    return float(trapezoid(risk, coverage))
++
++
++def f1_at_coverage(
++    y: np.ndarray, p: np.ndarray, gate: np.ndarray, coverage: float, threshold: float = 0.5
++) -> float:
++    """F1 over the most-confident fraction ``coverage`` of cases."""
++    y = np.asarray(y).reshape(-1)
++    p = np.asarray(p, dtype=np.float64).reshape(-1)
++    gate = np.asarray(gate, dtype=np.float64).reshape(-1)
++    n = len(y)
++    k = max(1, int(round(coverage * n)))
++    idx = np.argsort(-gate)[:k]
++    yhat = (p[idx] >= threshold).astype(int)
++    if len(np.unique(y[idx])) < 2:
++        return float((yhat == y[idx]).mean())
++    return float(f1_score(y[idx], yhat))
++
++
++class SelectivePredictor:
++    """Wrap calibrated probabilities + gate into accept/abstain decisions.
++
++    Args:
++        threshold: Decision threshold on probabilities.
++        gate_threshold: Gate value above which a prediction is made; below it
++            the model abstains (returns ``-1``).
++    """
++
++    def __init__(self, threshold: float = 0.5, gate_threshold: float = 0.5) -> None:
++        self.threshold = threshold
++        self.gate_threshold = gate_threshold
++
++    def predict(self, p: np.ndarray, gate: np.ndarray) -> np.ndarray:
++        """Return predictions in ``{0, 1}`` or ``-1`` for abstentions."""
++        p = np.asarray(p, dtype=np.float64).reshape(-1)
++        gate = np.asarray(gate, dtype=np.float64).reshape(-1)
++        yhat = (p >= self.threshold).astype(int)
++        yhat[gate < self.gate_threshold] = -1
++        return yhat
++
++    def coverage(self, gate: np.ndarray) -> float:
++        """Fraction of cases the predictor does not abstain on."""
++        gate = np.asarray(gate, dtype=np.float64).reshape(-1)
++        return float((gate >= self.gate_threshold).mean())
+diff --git a/src/data/__init__.py b/src/data/__init__.py
+new file mode 100644
+index 0000000..3644d65
+--- /dev/null
++++ b/src/data/__init__.py
+@@ -0,0 +1,22 @@
++"""Data layer: segmentation, feature extraction, confounds, datasets, splits."""
++
++from .splitter import LeakageFreeSplitter, add_corpus_id
++from .segmentation import Segment, segment_participant, segment_with_prompts, segment_with_vad
++from .confounds import ConfoundExtractor, CONFOUND_COLUMNS
++from .dataset import BagDataset, collate_bags, Bag
++from .bag_builder import BagBuilder
++
++__all__ = [
++    "BagBuilder",
++    "LeakageFreeSplitter",
++    "add_corpus_id",
++    "Segment",
++    "segment_participant",
++    "segment_with_prompts",
++    "segment_with_vad",
++    "ConfoundExtractor",
++    "CONFOUND_COLUMNS",
++    "BagDataset",
++    "collate_bags",
++    "Bag",
++]
+diff --git a/src/data/bag_builder.py b/src/data/bag_builder.py
+new file mode 100644
+index 0000000..1aa949d
+--- /dev/null
++++ b/src/data/bag_builder.py
+@@ -0,0 +1,97 @@
++"""Build MIL bags from a participant manifest, a segments manifest and cache.
++
++Bridges the on-disk feature cache (``data/interim/features/<seg_id>.pt``) and
++the in-memory :class:`Bag` structures consumed by the dataset/training code.
++Also supports restricting to a subset of modalities (e.g. acoustic-only for E0).
++"""
++
++from __future__ import annotations
++
++from typing import Dict, Iterable, List, Optional, Sequence
++
++import numpy as np
++import pandas as pd
++
++from .dataset import Bag, MODALITY_ORDER, make_group_id
++from .features import FeatureCache
++from .splitter import add_corpus_id
++
++
++class BagBuilder:
++    """Assemble :class:`Bag` objects on demand for given participants.
++
++    Args:
++        manifest_df: Participant-level manifest (``participant_id``, ``label``,
++            ``gender``, ``corpus``/``corpus_id``).
++        segments_df: Segment-level manifest (``participant_id``, ``seg_id``,
++            ``qtype``).
++        feature_cache: Cache to load per-segment feature dicts from.
++        modalities: Subset of modalities to keep; others are masked to ``None``.
++            ``None`` keeps all modalities.
++        n_gender: Number of gender classes (for group ids).
++    """
++
++    def __init__(
++        self,
++        manifest_df: pd.DataFrame,
++        segments_df: pd.DataFrame,
++        feature_cache: FeatureCache,
++        modalities: Optional[Iterable[str]] = None,
++        n_gender: int = 2,
++    ) -> None:
++        man = manifest_df.copy()
++        if "corpus_id" not in man.columns:
++            man = add_corpus_id(man)
++        self.manifest = man.set_index("participant_id")
++        self.segments = segments_df
++        self.cache = feature_cache
++        self.modalities = set(modalities) if modalities is not None else set(MODALITY_ORDER)
++        self.n_gender = n_gender
++        self._segs_by_pid = {
++            pid: grp for pid, grp in segments_df.groupby("participant_id")
++        }
++
++    def _segment_feature(self, seg_row: pd.Series, corpus_id: int, gender_id: int) -> Dict[str, object]:
++        feat = self.cache.load(seg_row["seg_id"])
++        seg: Dict[str, object] = {}
++        for m in MODALITY_ORDER:
++            val = feat.get(m)
++            seg[m] = val if (m in self.modalities and val is not None) else None
++        seg["qtype"] = int(seg_row.get("qtype", feat.get("qtype", 0)))
++        seg["corpus_id"] = int(corpus_id)
++        seg["gender_id"] = int(gender_id)
++        return seg
++
++    def build(self, participant_ids: Sequence[str]) -> List[Bag]:
++        """Return a list of bags for the requested participants.
++
++        Participants with no cached segments are skipped with no error so the
++        provider stays robust to partial feature extraction.
++        """
++        bags: List[Bag] = []
++        for pid in participant_ids:
++            if pid not in self.manifest.index or pid not in self._segs_by_pid:
++                continue
++            row = self.manifest.loc[pid]
++            corpus_id = int(row["corpus_id"])
++            gender_id = int(row.get("gender", 0))
++            segs = [
++                self._segment_feature(s, corpus_id, gender_id)
++                for _, s in self._segs_by_pid[pid].iterrows()
++            ]
++            if not segs:
++                continue
++            bags.append(
++                Bag(
++                    participant_id=pid,
++                    label=int(row["label"]),
++                    group_id=make_group_id(corpus_id, gender_id, self.n_gender),
++                    segments=segs,
++                )
++            )
++        return bags
++
++    def n_groups(self) -> int:
++        """Number of distinct ``(corpus, gender)`` groups for Group-DRO."""
++        n_corpus = int(self.manifest["corpus_id"].max()) + 1
++        return n_corpus * self.n_gender
+diff --git a/src/data/confounds.py b/src/data/confounds.py
+new file mode 100644
+index 0000000..050954d
+--- /dev/null
++++ b/src/data/confounds.py
+@@ -0,0 +1,90 @@
++"""Extraction and normalisation of confound metadata (NV2).
++
++Confounds (gender, age, interview length, comorbidity) are pulled from the
++participant manifest and standardised so the :mod:`eval.confound_eval` module
++can residualise model logits against them.
++"""
++
++from __future__ import annotations
++
++from typing import List, Optional
++
++import numpy as np
++import pandas as pd
++
++# Columns treated as confounds for residualisation / stratification.
++CONFOUND_COLUMNS: List[str] = [
++    "gender",
++    "age",
++    "interview_len_s",
++    "comorbidity_ptsd",
++]
++
++
++class ConfoundExtractor:
++    """Build a standardised confound matrix from a participant manifest.
++
++    Continuous columns are z-scored; binary/categorical columns are passed
++    through. Missing columns are skipped, missing values are mean/zero-filled.
++
++    Args:
++        columns: Confound columns to use (defaults to :data:`CONFOUND_COLUMNS`).
++    """
++
++    def __init__(self, columns: Optional[List[str]] = None) -> None:
++        self.columns = list(columns) if columns is not None else list(CONFOUND_COLUMNS)
++        self.means_: dict = {}
++        self.stds_: dict = {}
++        self.used_: List[str] = []
++
++    def fit(self, df: pd.DataFrame) -> "ConfoundExtractor":
++        """Learn normalisation statistics from a manifest."""
++        self.used_ = [c for c in self.columns if c in df.columns]
++        for col in self.used_:
++            vals = pd.to_numeric(df[col], errors="coerce")
++            self.means_[col] = float(np.nanmean(vals)) if vals.notna().any() else 0.0
++            std = float(np.nanstd(vals)) if vals.notna().any() else 0.0
++            self.stds_[col] = std if std > 1e-8 else 1.0
++        return self
++
++    def transform(self, df: pd.DataFrame) -> np.ndarray:
++        """Return a ``(n, k)`` standardised confound matrix.
++
++        Continuous columns (more than two unique values) are z-scored using the
++        statistics learned in :meth:`fit`; binary columns are mean-imputed only.
++        """
++        if not self.used_:
++            return np.zeros((len(df), 0), dtype=np.float64)
++        cols = []
++        for col in self.used_:
++            vals = pd.to_numeric(df[col], errors="coerce").to_numpy(dtype=float)
++            vals = np.where(np.isnan(vals), self.means_[col], vals)
++            n_unique = len(np.unique(vals))
++            if n_unique > 2:  # continuous -> z-score
++                vals = (vals - self.means_[col]) / self.stds_[col]
++            cols.append(vals)
++        return np.stack(cols, axis=1)
++
++    def fit_transform(self, df: pd.DataFrame) -> np.ndarray:
++        """Convenience wrapper around :meth:`fit` then :meth:`transform`."""
++        return self.fit(df).transform(df)
++
++
++def length_bins(interview_len_s: np.ndarray, n_bins: int = 3) -> np.ndarray:
++    """Bin interview lengths into quantile groups for stratified AUC reports.
++
++    Args:
++        interview_len_s: Array of interview durations.
++        n_bins: Number of quantile bins.
++
++    Returns:
++        Integer bin id per participant.
++    """
++    x = np.asarray(interview_len_s, dtype=float)
++    valid = ~np.isnan(x)
++    bins = np.zeros_like(x, dtype=int)
++    if valid.sum() == 0:
++        return bins
++    quantiles = np.quantile(x[valid], np.linspace(0, 1, n_bins + 1)[1:-1])
++    bins[valid] = np.digitize(x[valid], quantiles)
++    return bins
+diff --git a/src/data/dataset.py b/src/data/dataset.py
+new file mode 100644
+index 0000000..2cbf16c
+--- /dev/null
++++ b/src/data/dataset.py
+@@ -0,0 +1,149 @@
++"""MIL bag dataset and bag-level collate (participant = bag, segment = instance).
++
++Labels live at the *bag* (participant) level; segments are unlabelled
++instances. The collate function flattens every bag's segments into a single
++segment batch, records ``seg2bag`` so the model can re-pool segments into bags,
++builds per-modality padding masks and a ``modality_mask`` (modalities are never
++imputed — missing ones are masked out).
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass, field
++from typing import Dict, List, Optional, Sequence
++
++import numpy as np
++import torch
++from torch.nn.utils.rnn import pad_sequence
++from torch.utils.data import Dataset
++
++from .features import ACOUSTIC_DIM, AUDIO_DIM, TEXT_DIM, VISUAL_DIM
++
++# Fixed modality ordering shared with the model's encoder/modality_mask.
++MODALITY_ORDER: List[str] = ["audio", "acoustic", "text", "visual"]
++SEQ_MODALITIES = {"audio", "acoustic", "visual"}
++MODALITY_DIM = {
++    "audio": AUDIO_DIM,
++    "acoustic": ACOUSTIC_DIM,
++    "text": TEXT_DIM,
++    "visual": VISUAL_DIM,
++}
++N_GENDER = 2
++
++
++@dataclass
++class Bag:
++    """A participant-level bag of segment feature dicts.
++
++    Attributes:
++        participant_id: Owning participant.
++        label: Bag-level binary label.
++        group_id: ``(corpus, gender)`` group id for Group-DRO.
++        segments: List of per-segment feature dicts. Each dict has numpy arrays
++            (or ``None``) for ``audio/acoustic/text/visual`` plus integer
++            ``qtype``, ``corpus_id`` and ``gender_id``.
++    """
++
++    participant_id: str
++    label: int
++    group_id: int
++    segments: List[Dict[str, object]] = field(default_factory=list)
++
++
++def make_group_id(corpus_id: int, gender_id: int, n_gender: int = N_GENDER) -> int:
++    """Combine corpus and gender into a single Group-DRO group id."""
++    return int(corpus_id) * n_gender + int(gender_id)
++
++
++class BagDataset(Dataset):
++    """Dataset over participant bags.
++
++    Args:
++        bags: Sequence of :class:`Bag` objects (or equivalent dicts).
++    """
++
++    def __init__(self, bags: Sequence[Bag]) -> None:
++        self.bags: List[Bag] = [
++            b if isinstance(b, Bag) else Bag(**b) for b in bags
++        ]
++
++    def __len__(self) -> int:
++        return len(self.bags)
++
++    def __getitem__(self, idx: int) -> Bag:
++        return self.bags[idx]
++
++
++def _to_seq_tensor(arr: Optional[np.ndarray], dim: int) -> torch.Tensor:
++    """Convert a sequence modality array to a tensor, with a zero placeholder."""
++    if arr is None:
++        return torch.zeros(1, dim, dtype=torch.float32)
++    t = torch.as_tensor(np.asarray(arr), dtype=torch.float32)
++    if t.ndim == 1:
++        t = t.unsqueeze(0)
++    return t
++
++
++def collate_bags(bags: Sequence[Bag]) -> Dict[str, torch.Tensor]:
++    """Collate a list of bags into a flat segment batch.
++
++    Args:
++        bags: Bags returned by :class:`BagDataset`.
++
++    Returns:
++        Dict of tensors (see module docstring / blueprint section 3.6):
++        ``audio (N_seg,T,1024)``, ``audio_mask``, ``acoustic``,
++        ``acoustic_mask``, ``text (N_seg,768)``, ``visual``, ``visual_mask``,
++        ``modality_mask (N_seg,4)``, ``seg2bag (N_seg,)``, ``bag_labels (B,)``,
++        ``group_ids (B,)``, ``corpus_ids (N_seg,)``, ``gender_ids (N_seg,)``,
++        ``qtypes (N_seg,)``.
++    """
++    seq_lists: Dict[str, List[torch.Tensor]] = {m: [] for m in SEQ_MODALITIES}
++    text_list: List[torch.Tensor] = []
++    modality_mask: List[List[float]] = []
++    seg2bag: List[int] = []
++    corpus_ids: List[int] = []
++    gender_ids: List[int] = []
++    qtypes: List[int] = []
++    bag_labels: List[int] = []
++    group_ids: List[int] = []
++
++    for b_idx, bag in enumerate(bags):
++        bag_labels.append(int(bag.label))
++        group_ids.append(int(bag.group_id))
++        for seg in bag.segments:
++            present = []
++            for m in MODALITY_ORDER:
++                val = seg.get(m)
++                present.append(1.0 if val is not None else 0.0)
++                if m in SEQ_MODALITIES:
++                    seq_lists[m].append(_to_seq_tensor(val, MODALITY_DIM[m]))
++            txt = seg.get("text")
++            if txt is None:
++                text_list.append(torch.zeros(TEXT_DIM, dtype=torch.float32))
++            else:
++                text_list.append(torch.as_tensor(np.asarray(txt), dtype=torch.float32))
++            modality_mask.append(present)
++            seg2bag.append(b_idx)
++            corpus_ids.append(int(seg.get("corpus_id", 0)))
++            gender_ids.append(int(seg.get("gender_id", 0)))
++            qtypes.append(int(seg.get("qtype", 0)))
++
++    out: Dict[str, torch.Tensor] = {}
++    for m in ("audio", "acoustic", "visual"):
++        tensors = seq_lists[m]
++        lengths = torch.tensor([t.size(0) for t in tensors], dtype=torch.long)
++        padded = pad_sequence(tensors, batch_first=True)  # (N_seg, T_max, F)
++        t_max = padded.size(1)
++        mask = torch.arange(t_max)[None, :] < lengths[:, None]  # (N_seg, T_max)
++        out[m] = padded
++        out[f"{m}_mask"] = mask
++    out["text"] = torch.stack(text_list, dim=0)
++    out["modality_mask"] = torch.tensor(modality_mask, dtype=torch.float32)
++    out["seg2bag"] = torch.tensor(seg2bag, dtype=torch.long)
++    out["bag_labels"] = torch.tensor(bag_labels, dtype=torch.long)
++    out["group_ids"] = torch.tensor(group_ids, dtype=torch.long)
++    out["corpus_ids"] = torch.tensor(corpus_ids, dtype=torch.long)
++    out["gender_ids"] = torch.tensor(gender_ids, dtype=torch.long)
++    out["qtypes"] = torch.tensor(qtypes, dtype=torch.long)
++    return out
+diff --git a/src/data/features.py b/src/data/features.py
+new file mode 100644
+index 0000000..2892b3e
+--- /dev/null
++++ b/src/data/features.py
+@@ -0,0 +1,243 @@
++"""Per-modality feature extraction with on-disk caching.
++
++Each modality is an independent branch (acoustic is the mandatory strong
++baseline per prior findings). Backbones are *frozen*; only the light encoders
++downstream are trained. Extracted features are cached as ``.pt`` files keyed by
++segment id so they are never recomputed.
++
++Output shapes per segment:
++
++==========  =========================  ==================
++modality    backbone                   shape
++==========  =========================  ==================
++audio       wav2vec2 / HuBERT / XLS-R  ``(T_a, 1024)``
++acoustic    COVAREP + FORMANT z-score  ``(T_c, 79)``
++text        BERT / XLM-R ``[CLS]``     ``(768,)``
++visual      CLNF AUs + gaze + pose     ``(T_v, 50)``
++==========  =========================  ==================
++"""
++
++from __future__ import annotations
++
++from pathlib import Path
++from typing import Dict, Optional, Union
++
++import numpy as np
++
++from .segmentation import Segment
++
++# Canonical feature dimensions (must match the model's encoder ``in_dim``s).
++AUDIO_DIM = 1024
++ACOUSTIC_DIM = 79
++TEXT_DIM = 768
++VISUAL_DIM = 50
++MODALITIES = ("audio", "acoustic", "text", "visual")
++
++
++class AudioFeatureExtractor:
++    """Frame-level audio embeddings from a frozen wav2vec2-style backbone.
++
++    Args:
++        model_name: HuggingFace model id (e.g. ``facebook/wav2vec2-xls-r-300m``).
++        sample_rate: Expected audio sample rate.
++        device: Torch device string.
++    """
++
++    def __init__(
++        self,
++        model_name: str = "facebook/wav2vec2-xls-r-300m",
++        sample_rate: int = 16000,
++        device: str = "cpu",
++    ) -> None:
++        self.model_name = model_name
++        self.sample_rate = sample_rate
++        self.device = device
++        self._model = None
++        self._fe = None
++
++    def _lazy_init(self) -> None:
++        if self._model is not None:
++            return
++        try:
++            import torch  # noqa: F401
++            from transformers import AutoFeatureExtractor, AutoModel
++        except ImportError as exc:  # pragma: no cover - external dependency
++            raise ImportError(
++                "Audio features need 'transformers' and 'torch'."
++            ) from exc
++        self._fe = AutoFeatureExtractor.from_pretrained(self.model_name)
++        self._model = AutoModel.from_pretrained(self.model_name).to(self.device)
++        self._model.eval()
++
++    def extract(self, waveform: "np.ndarray") -> "np.ndarray":
++        """Return ``(T_a, 1024)`` last-hidden-state frames for a waveform."""
++        import torch
++
++        self._lazy_init()
++        inputs = self._fe(
++            waveform, sampling_rate=self.sample_rate, return_tensors="pt"
++        )
++        with torch.no_grad():
++            out = self._model(inputs.input_values.to(self.device))
++        return out.last_hidden_state.squeeze(0).cpu().numpy()
++
++
++class TextFeatureExtractor:
++    """``[CLS]`` sentence embedding from a frozen (multilingual) BERT.
++
++    Args:
++        model_name: HuggingFace model id (e.g. ``xlm-roberta-base``).
++        device: Torch device string.
++    """
++
++    def __init__(self, model_name: str = "xlm-roberta-base", device: str = "cpu") -> None:
++        self.model_name = model_name
++        self.device = device
++        self._model = None
++        self._tok = None
++
++    def _lazy_init(self) -> None:
++        if self._model is not None:
++            return
++        try:
++            import torch  # noqa: F401
++            from transformers import AutoModel, AutoTokenizer
++        except ImportError as exc:  # pragma: no cover - external dependency
++            raise ImportError("Text features need 'transformers' and 'torch'.") from exc
++        self._tok = AutoTokenizer.from_pretrained(self.model_name)
++        self._model = AutoModel.from_pretrained(self.model_name).to(self.device)
++        self._model.eval()
++
++    def extract(self, text: str) -> "np.ndarray":
++        """Return a ``(768,)`` ``[CLS]`` embedding for ``text``."""
++        import torch
++
++        self._lazy_init()
++        enc = self._tok(
++            text or "", return_tensors="pt", truncation=True, max_length=256
++        ).to(self.device)
++        with torch.no_grad():
++            out = self._model(**enc)
++        return out.last_hidden_state[:, 0, :].squeeze(0).cpu().numpy()
++
++
++def load_acoustic_csv(
++    path: Union[str, Path],
++    start_s: float,
++    end_s: float,
++    frame_rate: float = 100.0,
++    dim: int = ACOUSTIC_DIM,
++) -> np.ndarray:
++    """Load and z-score a slice of a COVAREP/FORMANT CSV.
++
++    Args:
++        path: CSV path with one row per frame.
++        start_s, end_s: Segment bounds in seconds.
++        frame_rate: Frames per second of the CSV (COVAREP default 100 Hz).
++        dim: Expected feature dimension.
++
++    Returns:
++        ``(T_c, dim)`` z-scored array (per-segment standardisation).
++    """
++    arr = np.loadtxt(path, delimiter=",")
++    if arr.ndim == 1:
++        arr = arr[None, :]
++    i0, i1 = int(start_s * frame_rate), int(end_s * frame_rate)
++    sl = arr[i0:i1, :dim]
++    if sl.shape[0] == 0:
++        sl = np.zeros((1, dim), dtype=np.float32)
++    mu, sigma = sl.mean(0, keepdims=True), sl.std(0, keepdims=True) + 1e-6
++    return ((sl - mu) / sigma).astype(np.float32)
++
++
++def load_visual_txt(
++    path: Union[str, Path],
++    start_s: float,
++    end_s: float,
++    frame_rate: float = 30.0,
++    dim: int = VISUAL_DIM,
++) -> np.ndarray:
++    """Load a slice of CLNF AU/gaze/pose features (DAIC only).
++
++    Args:
++        path: CLNF feature file (comma-separated, header skipped).
++        start_s, end_s: Segment bounds in seconds.
++        frame_rate: Frames per second (OpenFace/CLNF default 30 Hz).
++        dim: Expected feature dimension.
++
++    Returns:
++        ``(T_v, dim)`` array.
++    """
++    arr = np.loadtxt(path, delimiter=",", skiprows=1)
++    if arr.ndim == 1:
++        arr = arr[None, :]
++    i0, i1 = int(start_s * frame_rate), int(end_s * frame_rate)
++    sl = arr[i0:i1, -dim:]
++    if sl.shape[0] == 0:
++        sl = np.zeros((1, dim), dtype=np.float32)
++    return sl.astype(np.float32)
++
++
++class FeatureCache:
++    """Read/write ``.pt`` feature dicts keyed by segment id."""
++
++    def __init__(self, cache_dir: Union[str, Path]) -> None:
++        self.cache_dir = Path(cache_dir)
++        self.cache_dir.mkdir(parents=True, exist_ok=True)
++
++    def path_for(self, seg_id: str) -> Path:
++        return self.cache_dir / f"{seg_id}.pt"
++
++    def exists(self, seg_id: str) -> bool:
++        return self.path_for(seg_id).exists()
++
++    def save(self, seg_id: str, feat: Dict[str, object]) -> None:
++        import torch
++
++        torch.save(feat, self.path_for(seg_id))
++
++    def load(self, seg_id: str) -> Dict[str, object]:
++        import torch
++
++        # weights_only=False: the cache is produced by this pipeline and stores
++        # numpy arrays / metadata dicts (not untrusted checkpoints).
++        return torch.load(self.path_for(seg_id), map_location="cpu", weights_only=False)
++
++
++def build_segment_feature(
++    segment: Segment,
++    corpus: str,
++    gender: int,
++    language: str,
++    audio_arr: Optional[np.ndarray] = None,
++    acoustic_arr: Optional[np.ndarray] = None,
++    visual_arr: Optional[np.ndarray] = None,
++    text_arr: Optional[np.ndarray] = None,
++) -> Dict[str, object]:
++    """Assemble the per-segment feature dict consumed by the dataset.
++
++    Any modality passed as ``None`` is stored as ``None`` and later masked in
++    the collate function (never imputed).
++
++    Args:
++        segment: The source :class:`Segment`.
++        corpus, gender, language: Metadata copied into ``meta``.
++        audio_arr, acoustic_arr, visual_arr, text_arr: Pre-extracted arrays.
++
++    Returns:
++        Dict with modality tensors (as numpy arrays), ``qtype`` and ``meta``.
++    """
++    return {
++        "audio": audio_arr,
++        "acoustic": acoustic_arr,
++        "text": text_arr,
++        "visual": visual_arr,
++        "qtype": segment.qtype_id,
++        "meta": {
++            "participant_id": segment.participant_id,
++            "seg_id": segment.seg_id,
++            "corpus": corpus,
++            "gender": int(gender),
++            "language": language,
++        },
++    }
+diff --git a/src/data/segmentation.py b/src/data/segmentation.py
+new file mode 100644
+index 0000000..cf9fd2e
+--- /dev/null
++++ b/src/data/segmentation.py
+@@ -0,0 +1,250 @@
++"""Segmentation of interviews into response segments (NV: validity probe).
++
++Two strategies are supported:
++
++* **Prompt-based** (DAIC-WOZ): cut every answer between two consecutive
++  interviewer (``Ellie``) prompts and tag it with a ``question_type`` derived
++  from a *versioned, public* ``prompt2qtype.yaml`` mapping.
++* **VAD fallback** (EATD / Androids): cut turns with a voice-activity
++  detector (silero-vad) and tag ``question_type = "unknown"``.
++
++Segments shorter than ``MIN_SEG_S`` are dropped; longer than ``MAX_SEG_S`` are
++capped.
++"""
++
++from __future__ import annotations
++
++import re
++from dataclasses import dataclass, field
++from pathlib import Path
++from typing import Dict, List, Optional, Union
++
++import pandas as pd
++
++MIN_SEG_S: float = 3.0
++MAX_SEG_S: float = 60.0
++
++# Question-type vocabulary (kept in sync with configs/prompt2qtype.yaml).
++QTYPES: List[str] = [
++    "greeting",
++    "background",
++    "family",
++    "mood",
++    "sleep",
++    "work",
++    "stress",
++    "therapy",
++    "other",
++    "unknown",
++]
++QTYPE2ID: Dict[str, int] = {q: i for i, q in enumerate(QTYPES)}
++
++
++@dataclass
++class Segment:
++    """A single interview response segment.
++
++    Attributes:
++        seg_id: Globally unique segment id.
++        participant_id: Owning participant.
++        start_s: Start time in seconds within the source audio.
++        end_s: End time in seconds.
++        question_type: One of :data:`QTYPES`.
++        text: Optional transcript text for the segment.
++        audio_path: Path to the source audio file (offset/dur used to slice).
++    """
++
++    seg_id: str
++    participant_id: str
++    start_s: float
++    end_s: float
++    question_type: str = "unknown"
++    text: str = ""
++    audio_path: Optional[str] = None
++    extra: Dict[str, object] = field(default_factory=dict)
++
++    @property
++    def duration(self) -> float:
++        return float(self.end_s - self.start_s)
++
++    @property
++    def qtype_id(self) -> int:
++        return QTYPE2ID.get(self.question_type, QTYPE2ID["unknown"])
++
++
++def _match_qtype(prompt: str, prompt_map: Dict[str, str]) -> str:
++    """Map an interviewer prompt to a question type via substring rules.
++
++    ``prompt_map`` maps a (lower-cased) keyword/regex to a question type. The
++    first matching pattern wins; falls back to ``"other"``.
++    """
++    p = prompt.lower().strip()
++    for pattern, qtype in prompt_map.items():
++        if re.search(pattern.lower(), p):
++            return qtype if qtype in QTYPE2ID else "other"
++    return "other"
++
++
++def _filter_and_cap(segments: List[Segment]) -> List[Segment]:
++    """Drop too-short segments and cap too-long ones at :data:`MAX_SEG_S`."""
++    kept: List[Segment] = []
++    for seg in segments:
++        if seg.duration < MIN_SEG_S:
++            continue
++        if seg.duration > MAX_SEG_S:
++            seg.end_s = seg.start_s + MAX_SEG_S
++        kept.append(seg)
++    return kept
++
++
++def segment_with_prompts(
++    participant_id: str,
++    transcript_df: pd.DataFrame,
++    prompt_map: Dict[str, str],
++    audio_path: Optional[str] = None,
++    prompts_speaker: str = "Ellie",
++    speaker_col: str = "speaker",
++    start_col: str = "start_time",
++    stop_col: str = "stop_time",
++    text_col: str = "value",
++) -> List[Segment]:
++    """Cut participant answers between consecutive interviewer prompts.
++
++    Args:
++        participant_id: Participant identifier.
++        transcript_df: DAIC-style transcript with speaker/time/text columns.
++        prompt_map: Keyword -> question_type mapping (see prompt2qtype.yaml).
++        audio_path: Source audio path attached to each segment.
++        prompts_speaker: Speaker name of the interviewer.
++        speaker_col, start_col, stop_col, text_col: Column names.
++
++    Returns:
++        List of filtered :class:`Segment` objects.
++    """
++    df = transcript_df.sort_values(start_col).reset_index(drop=True)
++    segments: List[Segment] = []
++    current_qtype = "greeting"
++    pending_start: Optional[float] = None
++    pending_text: List[str] = []
++    pending_stop: Optional[float] = None
++    idx = 0
++
++    for _, row in df.iterrows():
++        speaker = str(row[speaker_col])
++        if speaker == prompts_speaker:
++            # Flush the participant answer accumulated before this prompt.
++            if pending_start is not None and pending_stop is not None:
++                segments.append(
++                    Segment(
++                        seg_id=f"{participant_id}_seg{idx:04d}",
++                        participant_id=participant_id,
++                        start_s=float(pending_start),
++                        end_s=float(pending_stop),
++                        question_type=current_qtype,
++                        text=" ".join(pending_text).strip(),
++                        audio_path=audio_path,
++                    )
++                )
++                idx += 1
++                pending_start, pending_stop, pending_text = None, None, []
++            # The new prompt determines the next answer's question type.
++            current_qtype = _match_qtype(str(row[text_col]), prompt_map)
++        else:
++            if pending_start is None:
++                pending_start = float(row[start_col])
++            pending_stop = float(row[stop_col])
++            pending_text.append(str(row[text_col]))
++
++    # Trailing answer with no closing prompt.
++    if pending_start is not None and pending_stop is not None:
++        segments.append(
++            Segment(
++                seg_id=f"{participant_id}_seg{idx:04d}",
++                participant_id=participant_id,
++                start_s=float(pending_start),
++                end_s=float(pending_stop),
++                question_type=current_qtype,
++                text=" ".join(pending_text).strip(),
++                audio_path=audio_path,
++            )
++        )
++    return _filter_and_cap(segments)
++
++
++def segment_with_vad(
++    participant_id: str,
++    audio_path: Union[str, Path],
++    sample_rate: int = 16000,
++) -> List[Segment]:
++    """Segment audio into turns using silero-vad (VAD fallback).
++
++    Used for corpora without an interviewer-prompt structure (EATD, Androids);
++    every segment receives ``question_type = "unknown"``.
++
++    Args:
++        participant_id: Participant identifier.
++        audio_path: Path to a 16 kHz wav file.
++        sample_rate: Expected sample rate.
++
++    Returns:
++        List of filtered :class:`Segment` objects.
++
++    Note:
++        Requires ``silero-vad`` and ``torchaudio``. If unavailable the function
++        raises a clear error rather than silently degrading.
++    """
++    try:
++        import torch
++        import torchaudio  # noqa: F401  (used to load audio)
++        from silero_vad import get_speech_timestamps, load_silero_vad, read_audio
++    except ImportError as exc:  # pragma: no cover - external dependency
++        raise ImportError(
++            "VAD segmentation needs 'silero-vad' and 'torchaudio'. "
++            "Install via `pip install silero-vad torchaudio`."
++        ) from exc
++
++    model = load_silero_vad()
++    wav = read_audio(str(audio_path), sampling_rate=sample_rate)
++    ts = get_speech_timestamps(
++        wav, model, sampling_rate=sample_rate, return_seconds=True
++    )
++    segments: List[Segment] = []
++    for i, span in enumerate(ts):
++        segments.append(
++            Segment(
++                seg_id=f"{participant_id}_seg{i:04d}",
++                participant_id=participant_id,
++                start_s=float(span["start"]),
++                end_s=float(span["end"]),
++                question_type="unknown",
++                audio_path=str(audio_path),
++            )
++        )
++    return _filter_and_cap(segments)
++
++
++def segment_participant(
++    participant_id: str,
++    audio_path: Optional[Union[str, Path]],
++    transcript_df: Optional[pd.DataFrame],
++    prompt_map: Optional[Dict[str, str]],
++    prompts_speaker: Optional[str],
++) -> List[Segment]:
++    """Dispatch to prompt-based or VAD segmentation based on availability.
++
++    If ``prompts_speaker`` and a transcript are provided, prompt-based
++    segmentation is used; otherwise the VAD fallback runs on the audio.
++    """
++    if prompts_speaker and transcript_df is not None and prompt_map is not None:
++        return segment_with_prompts(
++            participant_id,
++            transcript_df,
++            prompt_map,
++            audio_path=str(audio_path) if audio_path else None,
++            prompts_speaker=prompts_speaker,
++        )
++    if audio_path is None:
++        raise ValueError(
++            f"{participant_id}: no transcript/prompts and no audio for VAD."
++        )
++    return segment_with_vad(participant_id, audio_path)
+diff --git a/src/data/splitter.py b/src/data/splitter.py
+new file mode 100644
+index 0000000..d579aff
+--- /dev/null
++++ b/src/data/splitter.py
+@@ -0,0 +1,119 @@
++"""Leakage-free, participant-level cross-validation splitter (NV1).
++
++Two evaluation regimes are provided in one class:
++
++* ``pooled``: stratified K-fold over pooled corpora (statistical power).
++* ``loco`` : leave-one-corpus-out (genuine transfer test).
++
++The unit of splitting is always the *participant* so that no participant
++appears in more than one test fold and calibrators/thresholds are only ever
++fit on training participants.
++"""
++
++from __future__ import annotations
++
++from typing import Iterator, List, Tuple
++
++import pandas as pd
++from sklearn.model_selection import StratifiedKFold
++
++# Canonical, stable ordering of corpora -> integer ids.
++CORPUS_ORDER: List[str] = ["daic", "eatd", "androids", "edaic", "cmdc", "modma"]
++
++
++def add_corpus_id(df: pd.DataFrame, corpus_col: str = "corpus") -> pd.DataFrame:
++    """Return a copy of ``df`` with an integer ``corpus_id`` column.
++
++    Unknown corpora are appended deterministically after the canonical list so
++    the mapping is stable for a given manifest.
++
++    Args:
++        df: Manifest with a ``corpus`` column.
++        corpus_col: Name of the corpus column.
++
++    Returns:
++        Copy of ``df`` with an added ``corpus_id`` column.
++    """
++    out = df.copy()
++    known = {c: i for i, c in enumerate(CORPUS_ORDER)}
++    extras = sorted(set(out[corpus_col]) - set(known))
++    for i, c in enumerate(extras):
++        known[c] = len(CORPUS_ORDER) + i
++    out["corpus_id"] = out[corpus_col].map(known).astype(int)
++    return out
++
++
++class LeakageFreeSplitter:
++    """Participant-level CV splitter, stratified by ``(label, corpus)``.
++
++    Args:
++        manifest_df: Participant-level manifest. Must contain
++            ``participant_id``, ``label`` and ``corpus`` (``corpus_id`` is
++            derived if absent).
++        n_folds: Number of folds for the pooled regime.
++        seed: Random seed controlling the fold shuffle.
++        mode: ``"pooled"`` for stratified K-fold, ``"loco"`` for
++            leave-one-corpus-out.
++    """
++
++    def __init__(
++        self,
++        manifest_df: pd.DataFrame,
++        n_folds: int = 5,
++        seed: int = 0,
++        mode: str = "pooled",
++    ) -> None:
++        if mode not in {"pooled", "loco"}:
++            raise ValueError(f"Unknown mode '{mode}' (expected pooled|loco)")
++        df = manifest_df.reset_index(drop=True)
++        if "corpus_id" not in df.columns:
++            df = add_corpus_id(df)
++        self.df = df
++        self.k = n_folds
++        self.seed = seed
++        self.mode = mode
++
++    # -- public API ---------------------------------------------------------
++    def folds(self) -> Iterator[Tuple[List[str], List[str]]]:
++        """Yield ``(train_ids, test_ids)`` participant-id lists per fold."""
++        if self.mode == "pooled":
++            yield from self._pooled_folds()
++        else:
++            yield from self._loco_folds()
++
++    def n_splits(self) -> int:
++        """Number of folds for the configured mode."""
++        if self.mode == "pooled":
++            return self.k
++        return int(self.df["corpus_id"].nunique())
++
++    # -- regimes ------------------------------------------------------------
++    def _pooled_folds(self) -> Iterator[Tuple[List[str], List[str]]]:
++        # Stratify on a joint key so both positive rate and corpus mix are
++        # preserved across folds.
++        key = self.df["label"].astype(int) * 10 + self.df["corpus_id"].astype(int)
++        skf = StratifiedKFold(self.k, shuffle=True, random_state=self.seed)
++        pid = self.df["participant_id"].to_numpy()
++        for tr, te in skf.split(self.df, key):
++            yield pid[tr].tolist(), pid[te].tolist()
++
++    def _loco_folds(self) -> Iterator[Tuple[List[str], List[str]]]:
++        pid = self.df["participant_id"].to_numpy()
++        corpus = self.df["corpus_id"].to_numpy()
++        for held in sorted(self.df["corpus_id"].unique()):
++            test_mask = corpus == held
++            yield pid[~test_mask].tolist(), pid[test_mask].tolist()
++
++    # -- safety checks ------------------------------------------------------
++    def assert_no_leakage(self) -> None:
++        """Validate that no participant is shared across two test folds.
++
++        Raises:
++            AssertionError: If any participant appears in more than one test
++                fold (which would constitute leakage).
++        """
++        seen: set = set()
++        for _, test_ids in self.folds():
++            overlap = seen.intersection(test_ids)
++            assert not overlap, f"Participant leakage across folds: {overlap}"
++            seen.update(test_ids)
+diff --git a/src/eval/__init__.py b/src/eval/__init__.py
+new file mode 100644
+index 0000000..efae348
+--- /dev/null
++++ b/src/eval/__init__.py
+@@ -0,0 +1,29 @@
++"""Evaluation: metrics, confound analysis, statistics, validity probe."""
++
++from .metrics import (
++    roc_auc,
++    expected_calibration_error,
++    brier_score,
++    partial_auc,
++    sensitivity_specificity,
++    f1_precision_recall,
++    compute_all_metrics,
++)
++from .confound_eval import ConfoundEvaluator
++from .stats import bootstrap_ci, tost_equivalence, aggregate_seeds
++from .probe import QuestionTypeProbe
++
++__all__ = [
++    "roc_auc",
++    "expected_calibration_error",
++    "brier_score",
++    "partial_auc",
++    "sensitivity_specificity",
++    "f1_precision_recall",
++    "compute_all_metrics",
++    "ConfoundEvaluator",
++    "bootstrap_ci",
++    "tost_equivalence",
++    "aggregate_seeds",
++    "QuestionTypeProbe",
++]
+diff --git a/src/eval/confound_eval.py b/src/eval/confound_eval.py
+new file mode 100644
+index 0000000..6138a20
+--- /dev/null
++++ b/src/eval/confound_eval.py
+@@ -0,0 +1,125 @@
++"""Confound-controlled evaluation (NV2 — the headline contribution).
++
++Reports group-conditioned AUC, residualised AUC (logit regressed on
++confounds), and the specificity-gap = AUC(depression) - AUC(distress-proxy).
++"""
++
++from __future__ import annotations
++
++from typing import Dict
++
++import numpy as np
++from sklearn.linear_model import LinearRegression
++from sklearn.metrics import roc_auc_score
++
++
++def _safe_auc(y: np.ndarray, s: np.ndarray) -> float:
++    if len(np.unique(y)) < 2:
++        return float("nan")
++    return float(roc_auc_score(y, s))
++
++
++class ConfoundEvaluator:
++    """Confound analysis utilities.
++
++    All methods are static-style (stateless) and operate on numpy arrays so
++    they can be reused across folds/seeds.
++    """
++
++    def partial_auc_by_group(
++        self, y: np.ndarray, p: np.ndarray, group: np.ndarray
++    ) -> Dict[int, float]:
++        """AUC computed separately within each confound group.
++
++        Args:
++            y: Binary labels.
++            p: Predicted scores/probabilities.
++            group: Integer group id per sample (gender / corpus / length-bin).
++
++        Returns:
++            Mapping ``group_id -> AUC``.
++        """
++        y = np.asarray(y).reshape(-1)
++        p = np.asarray(p, dtype=np.float64).reshape(-1)
++        group = np.asarray(group).reshape(-1)
++        return {
++            int(g): _safe_auc(y[group == g], p[group == g])
++            for g in np.unique(group)
++        }
++
++    def residualized_auc(
++        self, y: np.ndarray, logit: np.ndarray, C: np.ndarray
++    ) -> float:
++        """AUC of the residual after regressing logits on confounds.
++
++        A large drop relative to the raw AUC indicates the model is exploiting
++        confounds rather than depression signal.
++
++        Args:
++            y: Binary labels.
++            logit: Uncalibrated logits.
++            C: ``(n, k)`` confound matrix (gender, age, length, ...).
++
++        Returns:
++            AUC computed on the residualised logits.
++        """
++        y = np.asarray(y).reshape(-1)
++        logit = np.asarray(logit, dtype=np.float64).reshape(-1)
++        C = np.asarray(C, dtype=np.float64)
++        if C.ndim == 1:
++            C = C.reshape(-1, 1)
++        if C.shape[1] == 0:
++            return _safe_auc(y, logit)
++        pred = LinearRegression().fit(C, logit).predict(C)
++        residual = logit - pred
++        return _safe_auc(y, residual)
++
++    def specificity_gap(
++        self, y_dep: np.ndarray, y_distress: np.ndarray, p: np.ndarray
++    ) -> float:
++        """``AUC(depression) - AUC(distress-proxy)``.
++
++        ``y_distress`` marks general distress (e.g. PTSD/anxiety or high score
++        below the depression threshold). A gap near zero means the model tracks
++        distress, not depression specifically.
++
++        Args:
++            y_dep: Depression labels.
++            y_distress: Distress-proxy labels.
++            p: Predicted scores.
++
++        Returns:
++            The specificity gap.
++        """
++        p = np.asarray(p, dtype=np.float64).reshape(-1)
++        return _safe_auc(np.asarray(y_dep).reshape(-1), p) - _safe_auc(
++            np.asarray(y_distress).reshape(-1), p
++        )
++
++    def evaluate(
++        self,
++        y: np.ndarray,
++        p: np.ndarray,
++        logit: np.ndarray,
++        C: np.ndarray,
++        groups: Dict[str, np.ndarray],
++    ) -> Dict[str, object]:
++        """Run the full confound report.
++
++        Args:
++            y: Binary labels.
++            p: Calibrated probabilities.
++            logit: Uncalibrated logits (for residualisation).
++            C: Confound matrix.
++            groups: Mapping ``name -> group_id_array`` (e.g. ``{"gender": ...}``).
++
++        Returns:
++            Nested dict with overall AUC, residualised AUC, and per-group AUCs.
++        """
++        report: Dict[str, object] = {
++            "auc": _safe_auc(np.asarray(y).reshape(-1), np.asarray(p).reshape(-1)),
++            "residualized_auc": self.residualized_auc(y, logit, C),
++        }
++        for name, g in groups.items():
++            report[f"auc_by_{name}"] = self.partial_auc_by_group(y, p, g)
++        return report
+diff --git a/src/eval/metrics.py b/src/eval/metrics.py
+new file mode 100644
+index 0000000..f558e07
+--- /dev/null
++++ b/src/eval/metrics.py
+@@ -0,0 +1,130 @@
++"""Core evaluation metrics.
++
++AUC-ROC is the primary, threshold-independent metric. Calibration (ECE,
++Brier), sensitivity/specificity and partial AUC are also reported.
++"""
++
++from __future__ import annotations
++
++from typing import Dict, Optional
++
++import numpy as np
++from sklearn.metrics import (
++    brier_score_loss,
++    f1_score,
++    precision_score,
++    recall_score,
++    roc_auc_score,
++)
++
++
++def roc_auc(y: np.ndarray, p: np.ndarray) -> float:
++    """ROC-AUC, returning ``nan`` when only one class is present."""
++    y = np.asarray(y).reshape(-1)
++    p = np.asarray(p, dtype=np.float64).reshape(-1)
++    if len(np.unique(y)) < 2:
++        return float("nan")
++    return float(roc_auc_score(y, p))
++
++
++def expected_calibration_error(
++    y: np.ndarray, p: np.ndarray, n_bins: int = 10
++) -> float:
++    """Expected Calibration Error with equal-width probability bins.
++
++    Args:
++        y: Binary labels.
++        p: Predicted probabilities.
++        n_bins: Number of bins over ``[0, 1]``.
++
++    Returns:
++        Weighted mean absolute gap between confidence and accuracy.
++    """
++    y = np.asarray(y, dtype=np.float64).reshape(-1)
++    p = np.asarray(p, dtype=np.float64).reshape(-1)
++    bins = np.linspace(0.0, 1.0, n_bins + 1)
++    idx = np.digitize(p, bins[1:-1], right=False)
++    ece = 0.0
++    n = len(y)
++    for b in range(n_bins):
++        mask = idx == b
++        if not mask.any():
++            continue
++        conf = p[mask].mean()
++        acc = y[mask].mean()
++        ece += (mask.sum() / n) * abs(conf - acc)
++    return float(ece)
++
++
++def brier_score(y: np.ndarray, p: np.ndarray) -> float:
++    """Brier score (mean squared error of probabilistic predictions)."""
++    y = np.asarray(y).reshape(-1)
++    p = np.asarray(p, dtype=np.float64).reshape(-1)
++    return float(brier_score_loss(y, p))
++
++
++def partial_auc(y: np.ndarray, p: np.ndarray, max_fpr: float = 0.2) -> float:
++    """Standardised partial AUC restricted to ``fpr <= max_fpr``.
++
++    Uses scikit-learn's McClish-corrected partial AUC.
++    """
++    y = np.asarray(y).reshape(-1)
++    p = np.asarray(p, dtype=np.float64).reshape(-1)
++    if len(np.unique(y)) < 2:
++        return float("nan")
++    return float(roc_auc_score(y, p, max_fpr=max_fpr))
++
++
++def sensitivity_specificity(
++    y: np.ndarray, yhat: np.ndarray
++) -> Dict[str, float]:
++    """Compute sensitivity (recall) and specificity from hard predictions."""
++    y = np.asarray(y).reshape(-1)
++    yhat = np.asarray(yhat).reshape(-1)
++    tp = float(((yhat == 1) & (y == 1)).sum())
++    tn = float(((yhat == 0) & (y == 0)).sum())
++    fp = float(((yhat == 1) & (y == 0)).sum())
++    fn = float(((yhat == 0) & (y == 1)).sum())
++    sens = tp / (tp + fn) if (tp + fn) > 0 else float("nan")
++    spec = tn / (tn + fp) if (tn + fp) > 0 else float("nan")
++    return {"sensitivity": sens, "specificity": spec}
++
++
++def f1_precision_recall(y: np.ndarray, yhat: np.ndarray) -> Dict[str, float]:
++    """F1, precision and recall from hard predictions."""
++    y = np.asarray(y).reshape(-1)
++    yhat = np.asarray(yhat).reshape(-1)
++    return {
++        "f1": float(f1_score(y, yhat, zero_division=0)),
++        "precision": float(precision_score(y, yhat, zero_division=0)),
++        "recall": float(recall_score(y, yhat, zero_division=0)),
++    }
++
++
++def compute_all_metrics(
++    y: np.ndarray,
++    p: np.ndarray,
++    threshold: float = 0.5,
++    max_fpr: float = 0.2,
++) -> Dict[str, float]:
++    """Compute the full primary metric suite for one prediction set.
++
++    Args:
++        y: Binary labels.
++        p: Calibrated probabilities.
++        threshold: Decision threshold for the hard-label metrics.
++        max_fpr: Upper FPR bound for partial AUC.
++
++    Returns:
++        Dict of metric name -> value.
++    """
++    yhat = (np.asarray(p, dtype=np.float64).reshape(-1) >= threshold).astype(int)
++    metrics: Dict[str, float] = {
++        "auc": roc_auc(y, p),
++        "partial_auc": partial_auc(y, p, max_fpr=max_fpr),
++        "ece": expected_calibration_error(y, p),
++        "brier": brier_score(y, p),
++    }
++    metrics.update(f1_precision_recall(y, yhat))
++    metrics.update(sensitivity_specificity(y, yhat))
++    return metrics
+diff --git a/src/eval/probe.py b/src/eval/probe.py
+new file mode 100644
+index 0000000..b737536
+--- /dev/null
++++ b/src/eval/probe.py
+@@ -0,0 +1,97 @@
++"""Question-type validity probe (revived segmentation, used for analysis).
++
++Groups segment-level logits by ``question_type`` x ``corpus`` to measure which
++question types carry transferable, confound-robust depression signal. Produces
++a table of ``question_type x {AUC_in, AUC_transfer, AUC_residualized}``.
++"""
++
++from __future__ import annotations
++
++from typing import Dict, List, Optional
++
++import numpy as np
++import pandas as pd
++
++from ..data.segmentation import QTYPES
++from .confound_eval import ConfoundEvaluator
++
++
++class QuestionTypeProbe:
++    """Aggregate segment predictions per question type and corpus.
++
++    Args:
++        qtypes: Ordered question-type vocabulary (defaults to
++            :data:`src.data.segmentation.QTYPES`).
++    """
++
++    def __init__(self, qtypes: Optional[List[str]] = None) -> None:
++        self.qtypes = list(qtypes) if qtypes is not None else list(QTYPES)
++        self._conf = ConfoundEvaluator()
++
++    def _auc(self, y: np.ndarray, s: np.ndarray) -> float:
++        from sklearn.metrics import roc_auc_score
++
++        if len(np.unique(y)) < 2:
++            return float("nan")
++        return float(roc_auc_score(y, s))
++
++    def run(
++        self,
++        seg_logits: np.ndarray,
++        seg_labels: np.ndarray,
++        qtype_ids: np.ndarray,
++        corpus_ids: np.ndarray,
++        confounds: Optional[np.ndarray] = None,
++    ) -> pd.DataFrame:
++        """Build the question-type validity table.
++
++        Args:
++            seg_logits: ``(N_seg,)`` segment depression logits.
++            seg_labels: ``(N_seg,)`` bag labels broadcast to segments.
++            qtype_ids: ``(N_seg,)`` question-type ids.
++            corpus_ids: ``(N_seg,)`` corpus ids.
++            confounds: Optional ``(N_seg, k)`` confound matrix for residualised
++                AUC.
++
++        Returns:
++            DataFrame with columns ``question_type, n, auc_in, auc_transfer_std,
++            auc_residualized``.
++        """
++        seg_logits = np.asarray(seg_logits, dtype=np.float64).reshape(-1)
++        seg_labels = np.asarray(seg_labels).reshape(-1)
++        qtype_ids = np.asarray(qtype_ids).reshape(-1)
++        corpus_ids = np.asarray(corpus_ids).reshape(-1)
++        p = 1.0 / (1.0 + np.exp(-seg_logits))
++
++        rows: List[Dict[str, object]] = []
++        for q in np.unique(qtype_ids):
++            qmask = qtype_ids == q
++            name = self.qtypes[q] if q < len(self.qtypes) else f"q{q}"
++            auc_in = self._auc(seg_labels[qmask], p[qmask])
++
++            # Transfer stability: spread of per-corpus AUC for this qtype.
++            per_corpus = []
++            for c in np.unique(corpus_ids[qmask]):
++                cm = qmask & (corpus_ids == c)
++                a = self._auc(seg_labels[cm], p[cm])
++                if not np.isnan(a):
++                    per_corpus.append(a)
++            transfer_std = float(np.std(per_corpus)) if len(per_corpus) > 1 else float("nan")
++
++            if confounds is not None and confounds.shape[1] > 0:
++                auc_res = self._conf.residualized_auc(
++                    seg_labels[qmask], seg_logits[qmask], np.asarray(confounds)[qmask]
++                )
++            else:
++                auc_res = float("nan")
++
++            rows.append(
++                {
++                    "question_type": name,
++                    "n": int(qmask.sum()),
++                    "auc_in": auc_in,
++                    "auc_transfer_std": transfer_std,
++                    "auc_residualized": auc_res,
++                }
++            )
++        return pd.DataFrame(rows).sort_values("auc_in", ascending=False).reset_index(drop=True)
+diff --git a/src/eval/stats.py b/src/eval/stats.py
+new file mode 100644
+index 0000000..a10db07
+--- /dev/null
++++ b/src/eval/stats.py
+@@ -0,0 +1,103 @@
++"""Statistics with sufficient power: bootstrap CIs, TOST, seed aggregation (NV5)."""
++
++from __future__ import annotations
++
++from typing import Callable, Dict, List, Sequence, Tuple
++
++import numpy as np
++from scipy.stats import t as student_t
++from sklearn.metrics import roc_auc_score
++
++
++def bootstrap_ci(
++    y: np.ndarray,
++    p: np.ndarray,
++    metric: Callable[[np.ndarray, np.ndarray], float] = roc_auc_score,
++    n: int = 2000,
++    level: float = 0.95,
++    seed: int = 0,
++) -> Tuple[float, Tuple[float, float]]:
++    """Participant-level bootstrap confidence interval for a metric.
++
++    Args:
++        y: Binary labels (one entry per participant).
++        p: Predicted scores (one entry per participant).
++        metric: Callable ``metric(y, p) -> float``.
++        n: Number of bootstrap resamples.
++        level: Confidence level.
++        seed: RNG seed.
++
++    Returns:
++        Tuple ``(mean, (lo, hi))``.
++    """
++    rng = np.random.default_rng(seed)
++    y = np.asarray(y).reshape(-1)
++    p = np.asarray(p, dtype=np.float64).reshape(-1)
++    idx0 = np.arange(len(y))
++    vals: List[float] = []
++    for _ in range(n):
++        s = rng.choice(idx0, len(idx0), replace=True)  # participant-level resample
++        try:
++            vals.append(float(metric(y[s], p[s])))
++        except ValueError:
++            # Skip resamples with a single class present.
++            continue
++    if not vals:
++        return float("nan"), (float("nan"), float("nan"))
++    lo, hi = np.percentile(vals, [(1 - level) / 2 * 100, (1 + level) / 2 * 100])
++    return float(np.mean(vals)), (float(lo), float(hi))
++
++
++def tost_equivalence(diffs: Sequence[float], eps: float) -> float:
++    """Two One-Sided Tests for equivalence within margin ``+/- eps``.
++
++    ``diffs`` is the per-(fold x seed) metric difference ``A - B``. The null is
++    ``|Delta| >= eps``; a returned p-value ``< 0.05`` lets us conclude
++    *equivalence* (not merely "no significant difference").
++
++    Args:
++        diffs: Paired metric differences.
++        eps: Pre-registered equivalence margin.
++
++    Returns:
++        The larger of the two one-sided p-values.
++    """
++    diffs = np.asarray(diffs, dtype=np.float64).reshape(-1)
++    n = len(diffs)
++    if n < 2:
++        return float("nan")
++    m = diffs.mean()
++    sd = diffs.std(ddof=1)
++    se = sd / np.sqrt(n) if sd > 0 else 1e-12
++    t_low = (m - (-eps)) / se
++    p_low = 1 - student_t.cdf(t_low, n - 1)
++    t_high = (eps - m) / se
++    p_high = 1 - student_t.cdf(t_high, n - 1)
++    return float(max(p_low, p_high))
++
++
++def aggregate_seeds(
++    per_run: Sequence[Dict[str, float]]
++) -> Dict[str, Dict[str, float]]:
++    """Aggregate metric dicts across folds x seeds.
++
++    Args:
++        per_run: List of metric dicts (one per fold/seed run).
++
++    Returns:
++        Mapping ``metric -> {"mean","std","n"}`` ignoring ``nan`` entries.
++    """
++    keys = set().union(*(d.keys() for d in per_run)) if per_run else set()
++    out: Dict[str, Dict[str, float]] = {}
++    for k in sorted(keys):
++        vals = np.array([d[k] for d in per_run if k in d], dtype=np.float64)
++        vals = vals[~np.isnan(vals)]
++        if len(vals) == 0:
++            out[k] = {"mean": float("nan"), "std": float("nan"), "n": 0}
++        else:
++            out[k] = {
++                "mean": float(vals.mean()),
++                "std": float(vals.std(ddof=1)) if len(vals) > 1 else 0.0,
++                "n": int(len(vals)),
++            }
++    return out
+diff --git a/src/losses/__init__.py b/src/losses/__init__.py
+new file mode 100644
+index 0000000..201a813
+--- /dev/null
++++ b/src/losses/__init__.py
+@@ -0,0 +1,7 @@
++"""Loss functions: Group-DRO, IRM penalty, intermodal consistency."""
++
++from .group_dro import GroupDROLoss
++from .irm import irm_penalty
++from .consistency import intermodal_consistency
++
++__all__ = ["GroupDROLoss", "irm_penalty", "intermodal_consistency"]
+diff --git a/src/losses/consistency.py b/src/losses/consistency.py
+new file mode 100644
+index 0000000..b9e0511
+--- /dev/null
++++ b/src/losses/consistency.py
+@@ -0,0 +1,46 @@
++"""Optional intermodal consistency loss (symmetric KL between modality logits).
++
++Encourages per-modality predictions to agree. Disabled by default
++(``delta = 0``) per the design; provided for completeness/ablation.
++"""
++
++from __future__ import annotations
++
++from typing import Sequence
++
++import torch
++import torch.nn.functional as F
++
++
++def _binary_kl(p_logit: torch.Tensor, q_logit: torch.Tensor) -> torch.Tensor:
++    """Symmetric KL between two Bernoulli distributions given by logits."""
++    p = torch.sigmoid(p_logit)
++    q = torch.sigmoid(q_logit)
++    eps = 1e-6
++    p = p.clamp(eps, 1 - eps)
++    q = q.clamp(eps, 1 - eps)
++
++    def kl(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
++        return a * (a / b).log() + (1 - a) * ((1 - a) / (1 - b)).log()
++
++    return 0.5 * (kl(p, q) + kl(q, p)).mean()
++
++
++def intermodal_consistency(modality_logits: Sequence[torch.Tensor]) -> torch.Tensor:
++    """Mean pairwise symmetric-KL consistency across modality logit streams.
++
++    Args:
++        modality_logits: Sequence of ``(N,)`` logit tensors, one per modality.
++
++    Returns:
++        Scalar consistency loss (``0`` if fewer than two modalities given).
++    """
++    if len(modality_logits) < 2:
++        return modality_logits[0].new_zeros(()) if modality_logits else torch.zeros(())
++    total = modality_logits[0].new_zeros(())
++    count = 0
++    for i in range(len(modality_logits)):
++        for j in range(i + 1, len(modality_logits)):
++            total = total + _binary_kl(modality_logits[i], modality_logits[j])
++            count += 1
++    return total / max(count, 1)
+diff --git a/src/losses/group_dro.py b/src/losses/group_dro.py
+new file mode 100644
+index 0000000..54f334b
+--- /dev/null
++++ b/src/losses/group_dro.py
+@@ -0,0 +1,55 @@
++"""Group Distributionally Robust Optimisation loss (NV3).
++
++Optimises the worst-performing group (e.g. depressed men) by maintaining an
++exponentiated-gradient distribution ``q`` over groups and weighting per-group
++losses by ``q``.
++"""
++
++from __future__ import annotations
++
++import torch
++from torch import nn
++
++
++class GroupDROLoss(nn.Module):
++    """Online Group-DRO with exponentiated weight updates.
++
++    Args:
++        n_groups: Number of groups ``G``.
++        step: Step size ``eta`` for the exponentiated update of ``q``.
++    """
++
++    def __init__(self, n_groups: int, step: float = 0.01) -> None:
++        super().__init__()
++        self.n_groups = n_groups
++        self.step = step
++        # Registered as a buffer so it moves with .to(device)/state_dict.
++        self.register_buffer("q", torch.ones(n_groups) / n_groups)
++
++    def forward(self, per_sample_loss: torch.Tensor, group_ids: torch.Tensor) -> torch.Tensor:
++        """Compute the Group-DRO objective for one batch.
++
++        Args:
++            per_sample_loss: ``(N,)`` per-sample losses (e.g. BCE, reduction
++                ``none``).
++            group_ids: ``(N,)`` integer group id per sample in ``[0, G)``.
++
++        Returns:
++            Scalar Group-DRO loss ``sum_g q_g * mean_loss_g``.
++        """
++        device = per_sample_loss.device
++        q = self.q.to(device)
++        g_losses = []
++        for g in range(self.n_groups):
++            mask = group_ids == g
++            if mask.any():
++                g_losses.append(per_sample_loss[mask].mean())
++            else:
++                g_losses.append(per_sample_loss.new_zeros(()))
++        g_loss = torch.stack(g_losses)                      # (G,)
++
++        # Exponentiated-gradient update on the (detached) group losses.
++        q = q * torch.exp(self.step * g_loss.detach())
++        q = q / q.sum()
++        self.q = q.detach()
++        return (q * g_loss).sum()
+diff --git a/src/losses/irm.py b/src/losses/irm.py
+new file mode 100644
+index 0000000..00d20b0
+--- /dev/null
++++ b/src/losses/irm.py
+@@ -0,0 +1,26 @@
++"""Invariant Risk Minimisation penalty (NV3, optional)."""
++
++from __future__ import annotations
++
++import torch
++import torch.nn.functional as F
++
++
++def irm_penalty(logits: torch.Tensor, y: torch.Tensor, dummy_w: torch.Tensor) -> torch.Tensor:
++    """IRMv1 gradient-norm penalty for a binary classifier.
++
++    The penalty is the squared gradient of the risk w.r.t. a constant dummy
++    classifier ``dummy_w`` applied to the logits; a small penalty means the
++    representation is (approximately) simultaneously optimal across environments.
++
++    Args:
++        logits: ``(N,)`` predicted logits.
++        y: ``(N,)`` binary targets.
++        dummy_w: A scalar tensor with ``requires_grad=True`` (value ``1.0``).
++
++    Returns:
++        Scalar IRM penalty (add to the total loss with a small coefficient).
++    """
++    loss = F.binary_cross_entropy_with_logits(logits * dummy_w, y.float())
++    grad = torch.autograd.grad(loss, dummy_w, create_graph=True)[0]
++    return grad.pow(2).sum()
+diff --git a/src/models/__init__.py b/src/models/__init__.py
+new file mode 100644
+index 0000000..106eebd
+--- /dev/null
++++ b/src/models/__init__.py
+@@ -0,0 +1,19 @@
++"""Model components for TransVal-Dep."""
++
++from .encoders import AttentionPool, ModalityEncoder, pool_segments_to_bags
++from .grl import GradientReversal, grad_reverse
++from .adversary import DomainAdversary
++from .heads import DepressionHead, SelectiveHead
++from .transval_net import TransValNet
++
++__all__ = [
++    "AttentionPool",
++    "ModalityEncoder",
++    "pool_segments_to_bags",
++    "GradientReversal",
++    "grad_reverse",
++    "DomainAdversary",
++    "DepressionHead",
++    "SelectiveHead",
++    "TransValNet",
++]
+diff --git a/src/models/adversary.py b/src/models/adversary.py
+new file mode 100644
+index 0000000..5ee7b0d
+--- /dev/null
++++ b/src/models/adversary.py
+@@ -0,0 +1,45 @@
++"""Domain adversary predicting corpus and gender from segment embeddings (NV3).
++
++Placed *after* a Gradient Reversal Layer so that minimising the adversary's
++loss forces the encoder to *erase* corpus/gender information from ``z_seg``.
++"""
++
++from __future__ import annotations
++
++from typing import Tuple
++
++import torch
++from torch import nn
++
++from .grl import GradientReversal
++
++
++class DomainAdversary(nn.Module):
++    """Predict ``corpus_id`` and ``gender_id`` from ``z_seg`` after GRL.
++
++    Args:
++        d: Embedding dimension of ``z_seg``.
++        n_corpus: Number of corpora.
++        n_gender: Number of gender classes.
++        lambd: Initial gradient-reversal strength.
++    """
++
++    def __init__(self, d: int, n_corpus: int, n_gender: int = 2, lambd: float = 1.0) -> None:
++        super().__init__()
++        self.grl = GradientReversal(lambd)
++        self.corpus_clf = nn.Sequential(
++            nn.Linear(d, d), nn.GELU(), nn.Linear(d, n_corpus)
++        )
++        self.gender_clf = nn.Sequential(
++            nn.Linear(d, d), nn.GELU(), nn.Linear(d, n_gender)
++        )
++
++    def forward(self, z: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
++        """Args:
++            z: ``(N, d)`` segment embeddings.
++
++        Returns:
++            Tuple of ``(corpus_logits (N,n_corpus), gender_logits (N,n_gender))``.
++        """
++        z = self.grl(z)
++        return self.corpus_clf(z), self.gender_clf(z)
+diff --git a/src/models/encoders.py b/src/models/encoders.py
+new file mode 100644
+index 0000000..1413a7a
+--- /dev/null
++++ b/src/models/encoders.py
+@@ -0,0 +1,114 @@
++"""Modality encoders, attention pooling and segment->bag pooling."""
++
++from __future__ import annotations
++
++from typing import Optional
++
++import torch
++from torch import nn
++
++
++class AttentionPool(nn.Module):
++    """Masked attention pooling of a frame sequence ``(N,T,d_in)`` -> ``(N,d_out)``.
++
++    Args:
++        d_in: Input feature dimension.
++        d_out: Output (pooled) dimension.
++    """
++
++    def __init__(self, d_in: int, d_out: int) -> None:
++        super().__init__()
++        self.proj = nn.Linear(d_in, d_out)
++        self.attn = nn.Linear(d_out, 1)
++
++    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
++        """Args:
++            x: ``(N, T, d_in)`` frame features.
++            mask: ``(N, T)`` boolean mask (``True`` = valid frame).
++
++        Returns:
++            ``(N, d_out)`` pooled representation.
++        """
++        h = torch.tanh(self.proj(x))           # (N, T, d_out)
++        a = self.attn(h).squeeze(-1)           # (N, T)
++        if mask is not None:
++            a = a.masked_fill(~mask, -1e4)
++        w = torch.softmax(a, dim=1).unsqueeze(-1)  # (N, T, 1)
++        return (w * h).sum(dim=1)              # (N, d_out)
++
++
++class ModalityEncoder(nn.Module):
++    """Encode one modality into a ``d``-dimensional vector.
++
++    * Sequence modalities (audio/acoustic/visual): BiLSTM + :class:`AttentionPool`.
++    * Static modality (text ``[CLS]``): MLP.
++
++    Args:
++        in_dim: Input feature dimension.
++        d: Output embedding dimension.
++        seq: If ``True`` treat input as a frame sequence ``(N,T,in_dim)``;
++            otherwise as ``(N,in_dim)``.
++    """
++
++    def __init__(self, in_dim: int, d: int, seq: bool = True) -> None:
++        super().__init__()
++        self.seq = seq
++        if seq:
++            self.rnn = nn.LSTM(in_dim, d // 2, batch_first=True, bidirectional=True)
++            self.pool = AttentionPool(d, d)
++        else:
++            self.mlp = nn.Sequential(
++                nn.Linear(in_dim, d), nn.GELU(), nn.LayerNorm(d)
++            )
++
++    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
++        """Return ``(N, d)`` embeddings."""
++        if self.seq:
++            h, _ = self.rnn(x)            # (N, T, d)
++            return self.pool(h, mask)     # (N, d)
++        return self.mlp(x)               # (N, d)
++
++
++def pool_segments_to_bags(
++    z_seg: torch.Tensor,
++    seg2bag: torch.Tensor,
++    n_bags: int,
++    attn: nn.Module,
++) -> torch.Tensor:
++    """Attention-pool segment embeddings into bag embeddings.
++
++    A learned linear scorer produces per-segment logits; segments belonging to
++    the same bag are softmax-normalised and combined. Replaces the hard mean of
++    the prior work.
++
++    Args:
++        z_seg: ``(N_seg, d)`` segment embeddings.
++        seg2bag: ``(N_seg,)`` mapping segment -> bag index in ``[0, n_bags)``.
++        n_bags: Number of bags ``B``.
++        attn: ``Linear(d, 1)`` scoring module.
++
++    Returns:
++        ``(B, d)`` bag embeddings. Empty bags map to a zero vector.
++
++    Note:
++        Implemented with a numerically-stable scatter softmax so it is fully
++        vectorised (no Python loop over bags).
++    """
++    d = z_seg.size(1)
++    scores = attn(z_seg).squeeze(-1)                       # (N_seg,)
++
++    # Scatter-softmax: subtract per-bag max for stability, then normalise.
++    bag_max = z_seg.new_full((n_bags,), float("-inf"))
++    bag_max = bag_max.scatter_reduce(0, seg2bag, scores, reduce="amax", include_self=True)
++    bag_max = torch.where(torch.isinf(bag_max), torch.zeros_like(bag_max), bag_max)
++    shifted = scores - bag_max[seg2bag]
++    exp = torch.exp(shifted)                               # (N_seg,)
++    denom = z_seg.new_zeros(n_bags).scatter_add(0, seg2bag, exp)
++    denom = denom.clamp_min(1e-12)
++    weights = (exp / denom[seg2bag]).unsqueeze(-1)         # (N_seg, 1)
++
++    z_bag = z_seg.new_zeros(n_bags, d)
++    z_bag = z_bag.scatter_add(
++        0, seg2bag.unsqueeze(-1).expand(-1, d), weights * z_seg
++    )
++    return z_bag
+diff --git a/src/models/grl.py b/src/models/grl.py
+new file mode 100644
+index 0000000..e6d455a
+--- /dev/null
++++ b/src/models/grl.py
+@@ -0,0 +1,43 @@
++"""Gradient Reversal Layer (core of the invariance objective, NV3)."""
++
++from __future__ import annotations
++
++import torch
++from torch import nn
++
++
++class _GradRev(torch.autograd.Function):
++    """Identity forward, sign-flipped (and scaled) gradient backward."""
++
++    @staticmethod
++    def forward(ctx, x: torch.Tensor, lambd: float) -> torch.Tensor:  # type: ignore[override]
++        ctx.lambd = lambd
++        return x.view_as(x)
++
++    @staticmethod
++    def backward(ctx, grad_output: torch.Tensor):  # type: ignore[override]
++        # Reverse and scale the gradient flowing back into the encoder.
++        return -ctx.lambd * grad_output, None
++
++
++def grad_reverse(x: torch.Tensor, lambd: float = 1.0) -> torch.Tensor:
++    """Functional gradient reversal."""
++    return _GradRev.apply(x, lambd)
++
++
++class GradientReversal(nn.Module):
++    """Module wrapper around :func:`grad_reverse`.
++
++    ``lambd`` is typically ramped up over training following
++    ``lambd = 2 / (1 + exp(-gamma * p)) - 1`` where ``p`` is training progress.
++
++    Args:
++        lambd: Initial reversal strength.
++    """
++
++    def __init__(self, lambd: float = 1.0) -> None:
++        super().__init__()
++        self.lambd = lambd
++
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        return grad_reverse(x, self.lambd)
+diff --git a/src/models/heads.py b/src/models/heads.py
+new file mode 100644
+index 0000000..59d44cd
+--- /dev/null
++++ b/src/models/heads.py
+@@ -0,0 +1,41 @@
++"""Prediction heads: depression logit and selective (abstain) gate."""
++
++from __future__ import annotations
++
++import torch
++from torch import nn
++
++
++class DepressionHead(nn.Module):
++    """Linear depression head producing a single logit per input.
++
++    Args:
++        d: Input embedding dimension.
++    """
++
++    def __init__(self, d: int) -> None:
++        super().__init__()
++        self.fc = nn.Linear(d, 1)
++
++    def forward(self, z: torch.Tensor) -> torch.Tensor:
++        """Return ``(B,)`` logits."""
++        return self.fc(z).squeeze(-1)
++
++
++class SelectiveHead(nn.Module):
++    """Selective-prediction gate ``g in [0,1]`` (1 = predict, 0 = abstain).
++
++    Trained jointly with a coverage penalty so the model can decline to predict
++    on low-confidence cases.
++
++    Args:
++        d: Input embedding dimension.
++    """
++
++    def __init__(self, d: int) -> None:
++        super().__init__()
++        self.fc = nn.Linear(d, 1)
++
++    def forward(self, z: torch.Tensor) -> torch.Tensor:
++        """Return ``(B,)`` gate values in ``[0, 1]``."""
++        return torch.sigmoid(self.fc(z)).squeeze(-1)
+diff --git a/src/models/transval_net.py b/src/models/transval_net.py
+new file mode 100644
+index 0000000..bfaf888
+--- /dev/null
++++ b/src/models/transval_net.py
+@@ -0,0 +1,112 @@
++"""TransValNet: assembled two-level (segment + bag) depression model.
++
++Per segment, each modality is encoded, fused (static MLP — fusion is
++deliberately simple), then:
++
++* a segment depression head produces auxiliary logits (probe + regulariser);
++* segments are attention-pooled into bags;
++* a bag depression head produces the main logit, plus a selective gate;
++* a GRL + domain adversary erase corpus/gender from ``z_seg``.
++"""
++
++from __future__ import annotations
++
++from typing import Dict, Optional
++
++import torch
++from torch import nn
++
++from ..data.dataset import MODALITY_ORDER
++from .adversary import DomainAdversary
++from .encoders import ModalityEncoder, pool_segments_to_bags
++from .heads import DepressionHead, SelectiveHead
++
++# Input dims per modality (frozen-backbone feature sizes).
++IN_DIMS = {"audio": 1024, "acoustic": 79, "text": 768, "visual": 50}
++
++
++class TransValNet(nn.Module):
++    """Full TransVal-Dep network.
++
++    Args:
++        d: Shared embedding dimension.
++        n_corpus: Number of corpora (for the adversary).
++        n_gender: Number of gender classes.
++        use_adv: Enable the domain adversary (NV3).
++        use_visual: Whether the visual modality is used (kept for config
++            symmetry; the visual branch always exists and is masked when
++            absent so missing-modality corpora still run).
++    """
++
++    def __init__(
++        self,
++        d: int = 128,
++        n_corpus: int = 3,
++        n_gender: int = 2,
++        use_adv: bool = True,
++        use_visual: bool = True,
++    ) -> None:
++        super().__init__()
++        self.d = d
++        self.use_visual = use_visual
++        self.enc = nn.ModuleDict(
++            {
++                "audio": ModalityEncoder(IN_DIMS["audio"], d, seq=True),
++                "acoustic": ModalityEncoder(IN_DIMS["acoustic"], d, seq=True),
++                "text": ModalityEncoder(IN_DIMS["text"], d, seq=False),
++                "visual": ModalityEncoder(IN_DIMS["visual"], d, seq=True),
++            }
++        )
++        self.fuse = nn.Sequential(
++            nn.Linear(len(MODALITY_ORDER) * d, d), nn.GELU(), nn.LayerNorm(d)
++        )
++        self.bag_attn = nn.Linear(d, 1)
++        self.dep_seg = DepressionHead(d)
++        self.dep_bag = DepressionHead(d)
++        self.selective = SelectiveHead(d)
++        self.adv: Optional[DomainAdversary] = (
++            DomainAdversary(d, n_corpus, n_gender) if use_adv else None
++        )
++
++    def encode_segments(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
++        """Encode + fuse all modalities into ``z_seg (N_seg, d)``."""
++        embeds = []
++        for m in MODALITY_ORDER:
++            x = batch[m]
++            if m == "text":
++                embeds.append(self.enc[m](x))
++            else:
++                embeds.append(self.enc[m](x, batch[f"{m}_mask"]))
++        # Stack -> (N_seg, n_mod, d), zero out absent modalities, then fuse.
++        E = torch.stack(embeds, dim=1)                       # (N_seg, M, d)
++        E = E * batch["modality_mask"].unsqueeze(-1)         # mask missing
++        return self.fuse(E.flatten(1))                       # (N_seg, d)
++
++    def forward(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
++        """Run the full forward pass.
++
++        Args:
++            batch: Output of :func:`src.data.dataset.collate_bags`.
++
++        Returns:
++            Dict with ``logit_bag (B,)``, ``logit_seg (N_seg,)``,
++            ``gate_bag (B,)``, ``z_seg``, ``z_bag`` and (if ``use_adv``)
++            ``corpus_logit``/``gender_logit``.
++        """
++        z_seg = self.encode_segments(batch)
++        n_bags = batch["bag_labels"].size(0)
++        z_bag = pool_segments_to_bags(
++            z_seg, batch["seg2bag"], n_bags, self.bag_attn
++        )
++        out: Dict[str, torch.Tensor] = {
++            "logit_bag": self.dep_bag(z_bag),
++            "logit_seg": self.dep_seg(z_seg),
++            "gate_bag": self.selective(z_bag),
++            "z_seg": z_seg,
++            "z_bag": z_bag,
++        }
++        if self.adv is not None:
++            corpus_logit, gender_logit = self.adv(z_seg)
++            out["corpus_logit"] = corpus_logit
++            out["gender_logit"] = gender_logit
++        return out
+diff --git a/src/train/__init__.py b/src/train/__init__.py
+new file mode 100644
+index 0000000..fad93d5
+--- /dev/null
++++ b/src/train/__init__.py
+@@ -0,0 +1,6 @@
++"""Training orchestration: per-fold trainer and multi-seed CV runner."""
++
++from .trainer import Trainer, TrainerConfig, gather_seg_labels
++from .cv_runner import CVRunner, CVConfig
++
++__all__ = ["Trainer", "TrainerConfig", "gather_seg_labels", "CVRunner", "CVConfig"]
+diff --git a/src/train/cv_runner.py b/src/train/cv_runner.py
+new file mode 100644
+index 0000000..4099781
+--- /dev/null
++++ b/src/train/cv_runner.py
+@@ -0,0 +1,195 @@
++"""Multi-seed, K-fold (or LOCO) cross-validation orchestrator (NV1 + NV5).
++
++Drives the full leakage-free protocol:
++
++1. For each seed and fold, split participants (test fold held out).
++2. Carve an inner-validation slice out of the training fold.
++3. Train, then fit the calibrator/threshold on the inner slice only.
++4. Predict each test participant exactly once and persist predictions.
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass, field
++from pathlib import Path
++from typing import Callable, Dict, List, Optional, Sequence
++
++import numpy as np
++import pandas as pd
++from torch.utils.data import DataLoader
++
++from ..data.dataset import Bag, BagDataset, collate_bags
++from ..data.splitter import LeakageFreeSplitter
++from ..eval.metrics import compute_all_metrics
++from ..eval.stats import aggregate_seeds
++from ..models.transval_net import TransValNet
++from ..utils.logging import get_logger
++from ..utils.seed import set_seed
++from .trainer import Trainer, TrainerConfig
++
++logger = get_logger("transval.cv")
++
++BagProvider = Callable[[List[str]], List[Bag]]
++ModelFactory = Callable[[], TransValNet]
++
++
++@dataclass
++class CVConfig:
++    """Cross-validation orchestration settings."""
++
++    n_folds: int = 5
++    seeds: List[int] = field(default_factory=lambda: [0, 1, 2, 3, 4])
++    mode: str = "pooled"            # pooled | loco
++    batch_bags: int = 8
++    inner_val_frac: float = 0.2
++    num_workers: int = 0
++    out_dir: str = "outputs"
++    exp_name: str = "exp"
++
++
++class CVRunner:
++    """Run multi-seed cross-validation for one experiment.
++
++    Args:
++        manifest_df: Participant-level manifest (needs ``participant_id``,
++            ``label``, ``corpus``).
++        bag_provider: Maps a list of participant ids to their :class:`Bag`s.
++        model_factory: Returns a fresh :class:`TransValNet` per fold/seed.
++        trainer_cfg: Training hyper-parameters.
++        cv_cfg: CV orchestration settings.
++        n_groups: Number of Group-DRO groups.
++    """
++
++    def __init__(
++        self,
++        manifest_df: pd.DataFrame,
++        bag_provider: BagProvider,
++        model_factory: ModelFactory,
++        trainer_cfg: TrainerConfig,
++        cv_cfg: CVConfig,
++        n_groups: int,
++    ) -> None:
++        self.manifest = manifest_df.reset_index(drop=True)
++        self.bag_provider = bag_provider
++        self.model_factory = model_factory
++        self.trainer_cfg = trainer_cfg
++        self.cv_cfg = cv_cfg
++        self.n_groups = n_groups
++        self._label_by_pid = dict(
++            zip(self.manifest["participant_id"], self.manifest["label"])
++        )
++        self.out_dir = Path(cv_cfg.out_dir)
++        (self.out_dir / "preds" / cv_cfg.exp_name).mkdir(parents=True, exist_ok=True)
++        (self.out_dir / "splits").mkdir(parents=True, exist_ok=True)
++
++    # -- helpers ------------------------------------------------------------
++    def _loader(self, bags: List[Bag], shuffle: bool) -> DataLoader:
++        return DataLoader(
++            BagDataset(bags),
++            batch_size=self.cv_cfg.batch_bags,
++            shuffle=shuffle,
++            num_workers=self.cv_cfg.num_workers,
++            collate_fn=lambda b: collate_bags(b),
++        )
++
++    def _inner_split(self, train_ids: List[str], seed: int) -> tuple:
++        """Stratified participant-level inner train/val split."""
++        from sklearn.model_selection import train_test_split
++
++        labels = [int(self._label_by_pid[p]) for p in train_ids]
++        stratify = labels if len(set(labels)) > 1 else None
++        inner_tr, inner_val = train_test_split(
++            train_ids,
++            test_size=self.cv_cfg.inner_val_frac,
++            random_state=seed,
++            stratify=stratify,
++        )
++        return inner_tr, inner_val
++
++    # -- main loop ----------------------------------------------------------
++    def run(self) -> Dict[str, object]:
++        """Execute all seeds x folds.
++
++        Returns:
++            Dict with ``per_run`` metric dicts, ``aggregate`` (mean/std/n) and
++            ``pred_files`` written.
++        """
++        per_run: List[Dict[str, float]] = []
++        pred_files: List[str] = []
++
++        for seed in self.cv_cfg.seeds:
++            set_seed(seed)
++            splitter = LeakageFreeSplitter(
++                self.manifest, n_folds=self.cv_cfg.n_folds, seed=seed, mode=self.cv_cfg.mode
++            )
++            for fold, (train_ids, test_ids) in enumerate(splitter.folds()):
++                metrics, preds_df = self._run_fold(train_ids, test_ids, fold, seed)
++                per_run.append(metrics)
++
++                pf = self.out_dir / "preds" / self.cv_cfg.exp_name / f"{fold}_{seed}.parquet"
++                self._save_parquet(preds_df, pf)
++                pred_files.append(str(pf))
++
++                self._save_split(train_ids, test_ids, fold, seed)
++                logger.info(
++                    "[%s] seed=%d fold=%d AUC=%.4f ECE=%.4f",
++                    self.cv_cfg.exp_name, seed, fold, metrics.get("auc", float("nan")),
++                    metrics.get("ece", float("nan")),
++                )
++
++        return {
++            "per_run": per_run,
++            "aggregate": aggregate_seeds(per_run),
++            "pred_files": pred_files,
++        }
++
++    def _run_fold(
++        self, train_ids: List[str], test_ids: List[str], fold: int, seed: int
++    ) -> tuple:
++        inner_tr, inner_val = self._inner_split(train_ids, seed)
++        train_loader = self._loader(self.bag_provider(inner_tr), shuffle=True)
++        val_loader = self._loader(self.bag_provider(inner_val), shuffle=False)
++
++        test_bags = self.bag_provider(test_ids)
++        test_loader = self._loader(test_bags, shuffle=False)
++
++        model = self.model_factory()
++        trainer = Trainer(model, self.trainer_cfg, self.n_groups)
++        trainer.fit(train_loader, val_loader)
++        trainer.calibrate(val_loader)
++
++        out = trainer.predict(test_loader)
++        metrics = compute_all_metrics(out["labels"], out["prob"], trainer.threshold)
++        metrics["threshold"] = float(trainer.threshold)
++
++        preds_df = pd.DataFrame(
++            {
++                "participant_id": [b.participant_id for b in test_bags],
++                "label": out["labels"],
++                "prob": out["prob"],
++                "prob_raw": out["prob_raw"],
++                "logit": out["logits"],
++                "gate": out["gate"],
++                "fold": fold,
++                "seed": seed,
++            }
++        )
++        return metrics, preds_df
++
++    # -- persistence --------------------------------------------------------
++    @staticmethod
++    def _save_parquet(df: pd.DataFrame, path: Path) -> None:
++        try:
++            df.to_parquet(path, index=False)
++        except (ImportError, ValueError):  # pragma: no cover - no parquet engine
++            df.to_csv(path.with_suffix(".csv"), index=False)
++
++    def _save_split(
++        self, train_ids: List[str], test_ids: List[str], fold: int, seed: int
++    ) -> None:
++        rows = [{"participant_id": p, "split": "train"} for p in train_ids] + \
++               [{"participant_id": p, "split": "test"} for p in test_ids]
++        pd.DataFrame(rows).to_csv(
++            self.out_dir / "splits" / f"{self.cv_cfg.exp_name}_{fold}_{seed}.csv",
++            index=False,
++        )
+diff --git a/src/train/trainer.py b/src/train/trainer.py
+new file mode 100644
+index 0000000..58d7452
+--- /dev/null
++++ b/src/train/trainer.py
+@@ -0,0 +1,280 @@
++"""Per-fold training loop with adversarial schedule and post-hoc calibration.
++
++Implements the total objective from blueprint section 7.1::
++
++    L = L_dep_bag + alpha * L_dep_seg + beta * L_adv + gamma * L_irm + delta * L_cons
++
++with an annealed gradient-reversal strength, optional Group-DRO for the bag
++loss, early stopping on an inner-validation AUC, and calibration fit *only* on
++the inner-validation split of the training fold.
++"""
++
++from __future__ import annotations
++
++import copy
++import math
++from dataclasses import dataclass, field
++from typing import Dict, List, Optional, Tuple
++
++import numpy as np
++import torch
++import torch.nn.functional as F
++from torch.nn.utils import clip_grad_norm_
++from torch.utils.data import DataLoader
++
++from ..calibration.calibrators import ProbabilityCalibrator, choose_threshold
++from ..eval.metrics import roc_auc
++from ..losses.consistency import intermodal_consistency
++from ..losses.group_dro import GroupDROLoss
++from ..losses.irm import irm_penalty
++from ..models.transval_net import TransValNet
++from ..utils.logging import get_logger
++
++logger = get_logger("transval.trainer")
++
++
++@dataclass
++class TrainerConfig:
++    """Hyper-parameters for :class:`Trainer`."""
++
++    epochs: int = 40
++    lr: float = 1e-3
++    grad_clip: float = 1.0
++    patience: int = 10
++    alpha: float = 0.3          # segment auxiliary weight
++    beta: float = 0.5           # adversary weight
++    gamma: float = 0.1          # IRM weight
++    delta: float = 0.0          # intermodal consistency weight
++    pos_weight: float = 2.0     # BCE positive class weight
++    use_group_dro: bool = True
++    use_irm: bool = False
++    grl_gamma: float = 10.0     # steepness of the lambda warmup schedule
++    weight_decay: float = 1e-5
++    device: str = "cpu"
++    calib_method: str = "isotonic"
++    threshold_strategy: str = "youden_inner"
++
++
++def gather_seg_labels(batch: Dict[str, torch.Tensor]) -> torch.Tensor:
++    """Broadcast bag labels to their segments via ``seg2bag``.
++
++    Used only for the auxiliary segment loss (segments have no hard label of
++    their own — see the MIL formulation).
++
++    Args:
++        batch: A collated batch.
++
++    Returns:
++        ``(N_seg,)`` float tensor of bag labels mapped to segments.
++    """
++    return batch["bag_labels"].float()[batch["seg2bag"]]
++
++
++def _move_batch(batch: Dict[str, torch.Tensor], device: str) -> Dict[str, torch.Tensor]:
++    return {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
++
++
++class Trainer:
++    """Train and calibrate a :class:`TransValNet` on one fold.
++
++    Args:
++        model: The network to train.
++        cfg: Training hyper-parameters.
++        n_groups: Number of Group-DRO groups.
++    """
++
++    def __init__(self, model: TransValNet, cfg: TrainerConfig, n_groups: int) -> None:
++        self.cfg = cfg
++        self.device = cfg.device
++        self.model = model.to(self.device)
++        self.opt = torch.optim.Adam(
++            self.model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay
++        )
++        self.group_dro = GroupDROLoss(n_groups).to(self.device) if cfg.use_group_dro else None
++        self.pos_weight = torch.tensor(cfg.pos_weight, device=self.device)
++        self.calibrator: Optional[ProbabilityCalibrator] = None
++        self.threshold: float = 0.5
++        self._best_state: Optional[dict] = None
++
++    # -- loss ---------------------------------------------------------------
++    def _compute_loss(
++        self, out: Dict[str, torch.Tensor], batch: Dict[str, torch.Tensor]
++    ) -> torch.Tensor:
++        labels = batch["bag_labels"].float()
++        per_sample = F.binary_cross_entropy_with_logits(
++            out["logit_bag"], labels, pos_weight=self.pos_weight, reduction="none"
++        )
++        if self.group_dro is not None:
++            # Group-DRO and pos_weight are not stacked; use plain per-sample here.
++            per_sample_dro = F.binary_cross_entropy_with_logits(
++                out["logit_bag"], labels, reduction="none"
++            )
++            l_dep = self.group_dro(per_sample_dro, batch["group_ids"])
++        else:
++            l_dep = per_sample.mean()
++
++        seg_labels = gather_seg_labels(batch)
++        l_seg = F.binary_cross_entropy_with_logits(out["logit_seg"], seg_labels)
++
++        total = l_dep + self.cfg.alpha * l_seg
++
++        if self.model.adv is not None and "corpus_logit" in out:
++            l_adv = F.cross_entropy(out["corpus_logit"], batch["corpus_ids"]) + \
++                F.cross_entropy(out["gender_logit"], batch["gender_ids"])
++            total = total + self.cfg.beta * l_adv
++
++        if self.cfg.use_irm:
++            dummy_w = torch.ones(1, device=self.device, requires_grad=True)
++            total = total + self.cfg.gamma * irm_penalty(
++                out["logit_bag"], batch["bag_labels"], dummy_w
++            )
++
++        if self.cfg.delta > 0:
++            # Consistency between segment and bag logit streams (broadcast).
++            bag_logit_for_seg = out["logit_bag"][batch["seg2bag"]]
++            total = total + self.cfg.delta * intermodal_consistency(
++                [out["logit_seg"], bag_logit_for_seg]
++            )
++        return total
++
++    # -- schedule -----------------------------------------------------------
++    def _lambda(self, progress: float) -> float:
++        """DANN-style gradient-reversal warmup: ``2/(1+e^{-gamma p}) - 1``."""
++        return 2.0 / (1.0 + math.exp(-self.cfg.grl_gamma * progress)) - 1.0
++
++    # -- training -----------------------------------------------------------
++    def fit(
++        self,
++        train_loader: DataLoader,
++        val_loader: Optional[DataLoader] = None,
++    ) -> "Trainer":
++        """Train with early stopping on inner-validation AUC.
++
++        Args:
++            train_loader: Inner-training bag loader.
++            val_loader: Inner-validation bag loader (for early stopping); if
++                ``None`` the last epoch's weights are kept.
++
++        Returns:
++            ``self`` (with best weights restored).
++        """
++        best_auc = -np.inf
++        best_state = copy.deepcopy(self.model.state_dict())
++        epochs_no_improve = 0
++
++        for epoch in range(self.cfg.epochs):
++            progress = epoch / max(self.cfg.epochs - 1, 1)
++            if self.model.adv is not None:
++                self.model.adv.grl.lambd = self._lambda(progress)
++
++            self.model.train()
++            for batch in train_loader:
++                batch = _move_batch(batch, self.device)
++                out = self.model(batch)
++                loss = self._compute_loss(out, batch)
++                self.opt.zero_grad()
++                loss.backward()
++                clip_grad_norm_(self.model.parameters(), self.cfg.grad_clip)
++                self.opt.step()
++
++            if val_loader is not None:
++                y, _, p = self._infer(val_loader)
++                auc = roc_auc(y, p)
++                auc = auc if not math.isnan(auc) else -np.inf
++                if auc > best_auc + 1e-5:
++                    best_auc = auc
++                    best_state = copy.deepcopy(self.model.state_dict())
++                    epochs_no_improve = 0
++                else:
++                    epochs_no_improve += 1
++                    if epochs_no_improve >= self.cfg.patience:
++                        logger.info("Early stopping at epoch %d (AUC=%.4f)", epoch, best_auc)
++                        break
++
++        self.model.load_state_dict(best_state)
++        self._best_state = best_state
++        return self
++
++    # -- inference ----------------------------------------------------------
++    @torch.no_grad()
++    def _infer(self, loader: DataLoader) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
++        """Return ``(labels, logits, sigmoid-probs)`` over a loader's bags."""
++        self.model.eval()
++        ys, logits = [], []
++        for batch in loader:
++            batch = _move_batch(batch, self.device)
++            out = self.model(batch)
++            logits.append(out["logit_bag"].cpu().numpy())
++            ys.append(batch["bag_labels"].cpu().numpy())
++        y = np.concatenate(ys) if ys else np.array([])
++        lg = np.concatenate(logits) if logits else np.array([])
++        p = 1.0 / (1.0 + np.exp(-lg)) if len(lg) else lg
++        return y, lg, p
++
++    # -- calibration --------------------------------------------------------
++    def calibrate(self, val_loader: DataLoader) -> "Trainer":
++        """Fit the calibrator + threshold on inner-validation only.
++
++        Args:
++            val_loader: Inner-validation bag loader (subset of the train fold).
++
++        Returns:
++            ``self`` with ``calibrator`` and ``threshold`` set.
++        """
++        y, logits, _ = self._infer(val_loader)
++        self.calibrator = ProbabilityCalibrator(self.cfg.calib_method).fit(logits, y)
++        p_cal = self.calibrator.transform(logits)
++        self.threshold = choose_threshold(y, p_cal, self.cfg.threshold_strategy)
++        return self
++
++    @torch.no_grad()
++    def predict(self, loader: DataLoader) -> Dict[str, np.ndarray]:
++        """Predict on a (test) loader, applying the train-fold calibrator.
++
++        Args:
++            loader: Test bag loader.
++
++        Returns:
++            Dict with ``labels``, ``logits``, ``prob`` (calibrated),
++            ``prob_raw`` (sigmoid) and ``gate``.
++        """
++        self.model.eval()
++        ys, logits, gates = [], [], []
++        for batch in loader:
++            batch = _move_batch(batch, self.device)
++            out = self.model(batch)
++            logits.append(out["logit_bag"].cpu().numpy())
++            gates.append(out["gate_bag"].cpu().numpy())
++            ys.append(batch["bag_labels"].cpu().numpy())
++        y = np.concatenate(ys) if ys else np.array([])
++        lg = np.concatenate(logits) if logits else np.array([])
++        gate = np.concatenate(gates) if gates else np.array([])
++        p_raw = 1.0 / (1.0 + np.exp(-lg)) if len(lg) else lg
++        p_cal = self.calibrator.transform(lg) if self.calibrator is not None else p_raw
++        return {
++            "labels": y,
++            "logits": lg,
++            "prob": np.asarray(p_cal),
++            "prob_raw": p_raw,
++            "gate": gate,
++        }
++
++    @torch.no_grad()
++    def predict_segments(self, loader: DataLoader) -> Dict[str, np.ndarray]:
++        """Collect segment-level logits/metadata for the validity probe."""
++        self.model.eval()
++        seg_logits, seg_labels, qtypes, corpus_ids = [], [], [], []
++        for batch in loader:
++            batch = _move_batch(batch, self.device)
++            out = self.model(batch)
++            seg_logits.append(out["logit_seg"].cpu().numpy())
++            seg_labels.append(gather_seg_labels(batch).cpu().numpy())
++            qtypes.append(batch["qtypes"].cpu().numpy())
++            corpus_ids.append(batch["corpus_ids"].cpu().numpy())
++        cat = lambda xs: np.concatenate(xs) if xs else np.array([])
++        return {
++            "seg_logits": cat(seg_logits),
++            "seg_labels": cat(seg_labels),
++            "qtypes": cat(qtypes),
++            "corpus_ids": cat(corpus_ids),
++        }
+diff --git a/src/utils/__init__.py b/src/utils/__init__.py
+new file mode 100644
+index 0000000..1a5a282
+--- /dev/null
++++ b/src/utils/__init__.py
+@@ -0,0 +1,8 @@
++"""Utility helpers: seeding, logging, config and a lightweight registry."""
++
++from .seed import set_seed
++from .logging import get_logger
++from .registry import Registry
++from .config import Config, load_config
++
++__all__ = ["set_seed", "get_logger", "Registry", "Config", "load_config"]
+diff --git a/src/utils/config.py b/src/utils/config.py
+new file mode 100644
+index 0000000..a760a64
+--- /dev/null
++++ b/src/utils/config.py
+@@ -0,0 +1,67 @@
++"""Attribute-accessible nested configuration loaded from YAML."""
++
++from __future__ import annotations
++
++from pathlib import Path
++from typing import Any, Dict, Iterator, Mapping, Union
++
++
++class Config(Mapping):
++    """A read-friendly nested config supporting both attribute and item access.
++
++    Nested dictionaries are recursively wrapped so that
++    ``cfg.model.use_adv`` and ``cfg["model"]["use_adv"]`` are equivalent.
++    """
++
++    def __init__(self, data: Dict[str, Any]) -> None:
++        object.__setattr__(self, "_data", {})
++        for key, value in data.items():
++            self._data[key] = Config(value) if isinstance(value, dict) else value
++
++    # -- attribute / item access -------------------------------------------
++    def __getattr__(self, item: str) -> Any:
++        try:
++            return self._data[item]
++        except KeyError as exc:  # pragma: no cover - defensive
++            raise AttributeError(item) from exc
++
++    def __setattr__(self, key: str, value: Any) -> None:
++        self._data[key] = Config(value) if isinstance(value, dict) else value
++
++    def __getitem__(self, item: str) -> Any:
++        return self._data[item]
++
++    def __iter__(self) -> Iterator[str]:
++        return iter(self._data)
++
++    def __len__(self) -> int:
++        return len(self._data)
++
++    def get(self, key: str, default: Any = None) -> Any:
++        return self._data.get(key, default)
++
++    def to_dict(self) -> Dict[str, Any]:
++        """Recursively convert back into plain dictionaries."""
++        out: Dict[str, Any] = {}
++        for key, value in self._data.items():
++            out[key] = value.to_dict() if isinstance(value, Config) else value
++        return out
++
++    def __repr__(self) -> str:  # pragma: no cover - cosmetic
++        return f"Config({self.to_dict()!r})"
++
++
++def load_config(path: Union[str, Path]) -> Config:
++    """Load a YAML file into a :class:`Config`.
++
++    Args:
++        path: Path to a ``.yaml`` file.
++
++    Returns:
++        Parsed configuration.
++    """
++    import yaml
++
++    with open(path, "r", encoding="utf-8") as fh:
++        data = yaml.safe_load(fh) or {}
++    return Config(data)
+diff --git a/src/utils/logging.py b/src/utils/logging.py
+new file mode 100644
+index 0000000..f76e4ce
+--- /dev/null
++++ b/src/utils/logging.py
+@@ -0,0 +1,42 @@
++"""Project-wide logging helper."""
++
++from __future__ import annotations
++
++import logging
++import sys
++from typing import Optional
++
++_CONFIGURED = False
++
++
++def get_logger(name: str = "transval", level: int = logging.INFO) -> logging.Logger:
++    """Return a configured :class:`logging.Logger`.
++
++    A single stream handler is attached to the root the first time this is
++    called; subsequent calls reuse the configuration.
++
++    Args:
++        name: Logger name.
++        level: Logging level.
++
++    Returns:
++        Configured logger instance.
++    """
++    global _CONFIGURED
++    if not _CONFIGURED:
++        handler = logging.StreamHandler(sys.stdout)
++        fmt = "%(asctime)s | %(levelname)-7s | %(name)s | %(message)s"
++        handler.setFormatter(logging.Formatter(fmt, datefmt="%H:%M:%S"))
++        root = logging.getLogger()
++        root.handlers.clear()
++        root.addHandler(handler)
++        root.setLevel(level)
++        _CONFIGURED = True
++    logger = logging.getLogger(name)
++    logger.setLevel(level)
++    return logger
++
++
++def set_level(level: int, name: Optional[str] = None) -> None:
++    """Set the logging level for a given logger (root by default)."""
++    logging.getLogger(name).setLevel(level)
+diff --git a/src/utils/registry.py b/src/utils/registry.py
+new file mode 100644
+index 0000000..b53cc3a
+--- /dev/null
++++ b/src/utils/registry.py
+@@ -0,0 +1,55 @@
++"""A minimal name -> object registry used for experiments and components."""
++
++from __future__ import annotations
++
++from typing import Callable, Dict, Iterator, Tuple, TypeVar
++
++T = TypeVar("T")
++
++
++class Registry:
++    """Tiny registry mapping string keys to callables/classes.
++
++    Example:
++        >>> MODELS = Registry("models")
++        >>> @MODELS.register("net")
++        ... class Net: ...
++        >>> MODELS.get("net")  # returns the Net class
++    """
++
++    def __init__(self, name: str) -> None:
++        self.name = name
++        self._store: Dict[str, object] = {}
++
++    def register(self, key: str) -> Callable[[T], T]:
++        """Decorator registering ``obj`` under ``key``."""
++
++        def _wrap(obj: T) -> T:
++            if key in self._store:
++                raise KeyError(f"'{key}' already registered in {self.name}")
++            self._store[key] = obj
++            return obj
++
++        return _wrap
++
++    def add(self, key: str, obj: object) -> None:
++        """Register ``obj`` imperatively."""
++        if key in self._store:
++            raise KeyError(f"'{key}' already registered in {self.name}")
++        self._store[key] = obj
++
++    def get(self, key: str) -> object:
++        """Retrieve a registered object, raising ``KeyError`` if missing."""
++        if key not in self._store:
++            raise KeyError(f"'{key}' not found in registry '{self.name}'. "
++                           f"Available: {sorted(self._store)}")
++        return self._store[key]
++
++    def __contains__(self, key: str) -> bool:
++        return key in self._store
++
++    def __iter__(self) -> Iterator[Tuple[str, object]]:
++        return iter(self._store.items())
++
++    def __len__(self) -> int:
++        return len(self._store)
+diff --git a/src/utils/seed.py b/src/utils/seed.py
+new file mode 100644
+index 0000000..c9fd6ff
+--- /dev/null
++++ b/src/utils/seed.py
+@@ -0,0 +1,32 @@
++"""Deterministic seeding across ``random``, ``numpy`` and ``torch``."""
++
++from __future__ import annotations
++
++import os
++import random
++
++import numpy as np
++
++
++def set_seed(seed: int, deterministic: bool = True) -> None:
++    """Seed all relevant RNGs for reproducible runs.
++
++    Args:
++        seed: Integer seed shared by all libraries.
++        deterministic: If ``True`` force deterministic cuDNN behaviour
++            (slower but reproducible). Torch is imported lazily so that the
++            rest of the package can be used without a torch install.
++    """
++    os.environ["PYTHONHASHSEED"] = str(seed)
++    random.seed(seed)
++    np.random.seed(seed)
++    try:
++        import torch
++
++        torch.manual_seed(seed)
++        torch.cuda.manual_seed_all(seed)
++        if deterministic:
++            torch.backends.cudnn.deterministic = True
++            torch.backends.cudnn.benchmark = False
++    except ImportError:  # pragma: no cover - torch optional for some scripts
++        pass
+diff --git a/tests/__init__.py b/tests/__init__.py
+new file mode 100644
+index 0000000..e69de29
+diff --git a/tests/conftest.py b/tests/conftest.py
+new file mode 100644
+index 0000000..8634165
+--- /dev/null
++++ b/tests/conftest.py
+@@ -0,0 +1,6 @@
++"""Make the repository root importable as ``src`` in tests."""
++
++import sys
++from pathlib import Path
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+diff --git a/tests/test_calibrator.py b/tests/test_calibrator.py
+new file mode 100644
+index 0000000..8ae16df
+--- /dev/null
++++ b/tests/test_calibrator.py
+@@ -0,0 +1,44 @@
++"""Tests for probability calibration and selective prediction."""
++
++import numpy as np
++
++from src.calibration.calibrators import ProbabilityCalibrator, choose_threshold
++from src.calibration.selective import aurc, risk_coverage_curve
++
++
++def _toy_data(n: int = 200, seed: int = 0):
++    rng = np.random.default_rng(seed)
++    y = rng.integers(0, 2, size=n)
++    logits = rng.normal(loc=(y * 2.0 - 1.0), scale=1.0)  # signal + noise
++    return y, logits
++
++
++def test_isotonic_outputs_valid_probabilities():
++    y, logits = _toy_data()
++    cal = ProbabilityCalibrator("isotonic").fit(logits, y)
++    p = cal.transform(logits)
++    assert p.shape == logits.shape
++    assert np.all((p >= 0) & (p <= 1))
++
++
++def test_platt_outputs_valid_probabilities():
++    y, logits = _toy_data()
++    p = ProbabilityCalibrator("platt").fit_transform(logits, y)
++    assert np.all((p >= 0) & (p <= 1))
++
++
++def test_choose_threshold_in_unit_interval():
++    y, logits = _toy_data()
++    p = ProbabilityCalibrator("isotonic").fit_transform(logits, y)
++    thr = choose_threshold(y, p, "youden_inner")
++    assert 0.0 <= thr <= 1.0
++
++
++def test_risk_coverage_curve_shapes():
++    y, logits = _toy_data()
++    p = 1 / (1 + np.exp(-logits))
++    gate = np.abs(p - 0.5)  # confidence proxy
++    cov, risk = risk_coverage_curve(y, p, gate)
++    assert len(cov) == len(risk) == len(y)
++    assert cov[-1] == 1.0
++    assert 0.0 <= aurc(cov, risk) <= 1.0
+diff --git a/tests/test_grl.py b/tests/test_grl.py
+new file mode 100644
+index 0000000..f3fe967
+--- /dev/null
++++ b/tests/test_grl.py
+@@ -0,0 +1,26 @@
++"""Tests for the gradient reversal layer."""
++
++import torch
++
++from src.models.grl import GradientReversal, grad_reverse
++
++
++def test_forward_is_identity():
++    x = torch.randn(4, 3)
++    out = GradientReversal(0.7)(x)
++    assert torch.allclose(out, x)
++
++
++def test_backward_reverses_and_scales_gradient():
++    x = torch.randn(5, 2, requires_grad=True)
++    lambd = 2.0
++    y = grad_reverse(x, lambd).sum()
++    y.backward()
++    # d(sum x)/dx = 1 everywhere; GRL flips sign and scales by lambd.
++    assert torch.allclose(x.grad, torch.full_like(x.grad, -lambd))
++
++
++def test_lambda_zero_blocks_gradient():
++    x = torch.randn(3, requires_grad=True)
++    grad_reverse(x, 0.0).sum().backward()
++    assert torch.allclose(x.grad, torch.zeros_like(x.grad))
+diff --git a/tests/test_model_forward.py b/tests/test_model_forward.py
+new file mode 100644
+index 0000000..802fb3b
+--- /dev/null
++++ b/tests/test_model_forward.py
+@@ -0,0 +1,98 @@
++"""Shape + gradient smoke tests for collate, the network and a training step."""
++
++import numpy as np
++import torch
++
++from src.data.dataset import Bag, collate_bags, make_group_id
++from src.losses.group_dro import GroupDROLoss
++from src.models.encoders import pool_segments_to_bags
++from src.models.transval_net import TransValNet
++from src.train.trainer import Trainer, TrainerConfig, gather_seg_labels
++
++
++def _toy_segment(with_visual: bool = True):
++    return {
++        "audio": np.random.randn(7, 1024).astype("float32"),
++        "acoustic": np.random.randn(5, 79).astype("float32"),
++        "text": np.random.randn(768).astype("float32"),
++        "visual": np.random.randn(4, 50).astype("float32") if with_visual else None,
++        "qtype": 3,
++        "corpus_id": 0,
++        "gender_id": 1,
++    }
++
++
++def _toy_bags(n_bags: int = 4):
++    bags = []
++    for b in range(n_bags):
++        segs = [_toy_segment(with_visual=(b % 2 == 0)) for _ in range(3)]
++        bags.append(
++            Bag(
++                participant_id=f"p{b}",
++                label=b % 2,
++                group_id=make_group_id(0, b % 2),
++                segments=segs,
++            )
++        )
++    return bags
++
++
++def test_collate_shapes():
++    batch = collate_bags(_toy_bags(4))
++    n_seg = batch["seg2bag"].numel()
++    assert batch["audio"].shape[0] == n_seg
++    assert batch["text"].shape == (n_seg, 768)
++    assert batch["modality_mask"].shape == (n_seg, 4)
++    assert batch["bag_labels"].shape == (4,)
++    assert batch["seg2bag"].max().item() == 3
++
++
++def test_forward_shapes():
++    batch = collate_bags(_toy_bags(4))
++    net = TransValNet(d=32, n_corpus=3, use_adv=True)
++    out = net(batch)
++    assert out["logit_bag"].shape == (4,)
++    assert out["logit_seg"].shape == (batch["seg2bag"].numel(),)
++    assert out["gate_bag"].shape == (4,)
++    assert out["corpus_logit"].shape[0] == batch["seg2bag"].numel()
++
++
++def test_pool_segments_to_bags_partition():
++    z = torch.randn(6, 8)
++    seg2bag = torch.tensor([0, 0, 1, 1, 2, 2])
++    attn = torch.nn.Linear(8, 1)
++    z_bag = pool_segments_to_bags(z, seg2bag, 3, attn)
++    assert z_bag.shape == (3, 8)
++    assert torch.isfinite(z_bag).all()
++
++
++def test_group_dro_step():
++    loss = GroupDROLoss(4)
++    per_sample = torch.rand(8)
++    groups = torch.tensor([0, 0, 1, 1, 2, 2, 3, 3])
++    val = loss(per_sample, groups)
++    assert val.ndim == 0
++    assert abs(float(loss.q.sum()) - 1.0) < 1e-5
++
++
++def test_training_step_runs_and_backprops():
++    bags = _toy_bags(6)
++    batch = collate_bags(bags)
++    net = TransValNet(d=16, n_corpus=3, use_adv=True)
++    cfg = TrainerConfig(epochs=1, use_group_dro=True, use_irm=True, device="cpu")
++    trainer = Trainer(net, cfg, n_groups=6)
++    out = net(batch)
++    loss = trainer._compute_loss(out, batch)
++    loss.backward()
++    assert torch.isfinite(loss)
++    grads = [p.grad for p in net.parameters() if p.grad is not None]
++    assert len(grads) > 0
++
++
++def test_gather_seg_labels_broadcast():
++    batch = collate_bags(_toy_bags(3))
++    seg_labels = gather_seg_labels(batch)
++    assert seg_labels.shape[0] == batch["seg2bag"].numel()
++    # Each segment label equals its bag's label.
++    for i, b in enumerate(batch["seg2bag"].tolist()):
++        assert seg_labels[i].item() == batch["bag_labels"][b].item()
+diff --git a/tests/test_splitter.py b/tests/test_splitter.py
+new file mode 100644
+index 0000000..8199c0b
+--- /dev/null
++++ b/tests/test_splitter.py
+@@ -0,0 +1,55 @@
++"""Tests for the leakage-free participant-level splitter."""
++
++import pandas as pd
++import pytest
++
++from src.data.splitter import LeakageFreeSplitter, add_corpus_id
++
++
++def _toy_manifest(n: int = 60) -> pd.DataFrame:
++    rows = []
++    for i in range(n):
++        rows.append(
++            {
++                "participant_id": f"p{i}",
++                "corpus": ["daic", "eatd", "androids"][i % 3],
++                "label": i % 2,
++            }
++        )
++    return add_corpus_id(pd.DataFrame(rows))
++
++
++def test_no_participant_leakage_across_test_folds():
++    df = _toy_manifest()
++    splitter = LeakageFreeSplitter(df, n_folds=5, seed=0, mode="pooled")
++    seen = set()
++    for _, test_ids in splitter.folds():
++        assert not seen.intersection(test_ids), "participant appears in two test folds"
++        seen.update(test_ids)
++    # Every participant is tested exactly once.
++    assert seen == set(df["participant_id"])
++
++
++def test_train_test_disjoint():
++    df = _toy_manifest()
++    splitter = LeakageFreeSplitter(df, n_folds=5, seed=1)
++    for train_ids, test_ids in splitter.folds():
++        assert set(train_ids).isdisjoint(test_ids)
++
++
++def test_assert_no_leakage_passes():
++    df = _toy_manifest()
++    LeakageFreeSplitter(df, n_folds=5, seed=2).assert_no_leakage()
++
++
++def test_loco_holds_out_one_corpus():
++    df = _toy_manifest()
++    splitter = LeakageFreeSplitter(df, mode="loco")
++    n = 0
++    for train_ids, test_ids in splitter.folds():
++        train_corpora = set(df.set_index("participant_id").loc[train_ids, "corpus"])
++        test_corpora = set(df.set_index("participant_id").loc[test_ids, "corpus"])
++        assert len(test_corpora) == 1
++        assert test_corpora.isdisjoint(train_corpora)
++        n += 1
++    assert n == df["corpus"].nunique()

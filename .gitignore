@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ipynb_checkpoints/
+*.egg-info/
+.venv/
+venv/
+
+# Data & artifacts (keep manifests dir, ignore heavy contents)
+data/raw/
+data/interim/
+outputs/
+*.pt
+*.npy
+*.parquet
+!data/manifests/.gitkeep

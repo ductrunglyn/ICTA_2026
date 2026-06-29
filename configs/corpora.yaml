@@ -1,0 +1,34 @@
+# Unified corpus schema. Every corpus is mapped to a common layout so the code
+# is corpus-agnostic. {pid} is substituted with the participant id.
+daic_woz:
+  corpus: daic
+  language: en
+  audio_dir: data/raw/daic/{pid}/{pid}_AUDIO.wav
+  transcript: data/raw/daic/{pid}/{pid}_TRANSCRIPT.csv
+  prompts_speaker: Ellie            # interviewer name used to cut segments
+  label_csv: data/raw/daic/labels.csv   # Participant_ID, PHQ8_Binary, PHQ8_Score, Gender
+  acoustic: data/raw/daic/{pid}/{pid}_COVAREP.csv
+  visual: data/raw/daic/{pid}/{pid}_CLNF_AUs.txt
+  label_threshold: 10               # PHQ-8 >= 10 -> positive
+
+eatd:
+  corpus: eatd
+  language: zh
+  audio_dir: data/raw/eatd/{pid}/*.wav
+  transcript: null
+  prompts_speaker: null             # no Ellie structure -> VAD segmentation
+  label_csv: data/raw/eatd/labels.csv
+  acoustic: null
+  visual: null
+  label_threshold: 53               # SDS index threshold (corpus convention)
+
+androids:
+  corpus: androids
+  language: it
+  audio_dir: data/raw/androids/{pid}/interview.wav
+  transcript: null
+  prompts_speaker: null
+  label_csv: data/raw/androids/labels.csv
+  acoustic: null
+  visual: null
+  label_threshold: null             # corpus provides binary labels directly

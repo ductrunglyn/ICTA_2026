@@ -1,0 +1,10 @@
+# E2: E1 + corpus-adversary (NV3). Tests whether transfer improves.
+model:
+  use_adv: true
+  use_group_dro: false
+loss:
+  beta: 0.5
+cv:
+  exp_name: E2_corpus_adv
+# Gender-adversary head is present but its target can be neutralised by setting
+# beta_gender weighting in the trainer if a corpus-only ablation is desired.

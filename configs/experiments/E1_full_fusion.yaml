@@ -1,0 +1,8 @@
+# E1: Full fusion, no adversary, no Group-DRO. Multimodal baseline.
+model:
+  use_adv: false
+  use_group_dro: false
+loss:
+  beta: 0.0
+cv:
+  exp_name: E1_full_fusion

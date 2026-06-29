@@ -1,0 +1,10 @@
+# E5: E4 + IRM penalty. Tests stronger invariance.
+model:
+  use_adv: true
+  use_group_dro: true
+  use_irm: true
+loss:
+  beta: 0.5
+  gamma: 0.1
+cv:
+  exp_name: E5_irm

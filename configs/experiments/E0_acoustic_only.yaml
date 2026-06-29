@@ -1,0 +1,12 @@
+# E0: Acoustic-only + calibration. Mandatory baseline everything must beat.
+model:
+  use_adv: false
+  use_group_dro: false
+  use_visual: false
+loss:
+  alpha: 0.0
+  beta: 0.0
+cv:
+  exp_name: E0_acoustic_only
+# NOTE: drive single-modality behaviour by feeding only the acoustic branch in
+# the bag_provider (mask audio/text/visual). See scripts/02_run_cv.py.
