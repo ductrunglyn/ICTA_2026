@@ -1,10 +1,14 @@
 # Single-corpus (DAIC-WOZ) experiment: audio + text modalities.
 #
-# With one corpus the corpus-adversary is a no-op (n_corpus=1), but the
-# gender-adversary and gender Group-DRO remain active for fairness/robustness.
-# LOCO is not applicable with a single corpus -> use pooled CV.
+# Tuned for small-n stability (n<=189): smaller model + dropout + stronger weight
+# decay to curb overfit; Platt calibration + fixed 0.5 threshold (Youden on tiny
+# inner-val folds was unstable, threshold std ~0.23).
+#
+# With one corpus the corpus-adversary is inert (n_corpus=1); the gender-adversary
+# and gender Group-DRO remain active. LOCO is N/A with one corpus -> pooled CV.
 model:
-  d: 128
+  d: 64                  # was 128 -> reduce capacity for small n
+  dropout: 0.3
   use_adv: true          # gender-adversary still meaningful (corpus head inert)
   use_group_dro: true    # groups = (corpus, gender) -> here just gender
   use_irm: false
@@ -13,8 +17,19 @@ model:
 
 loss:
   alpha: 0.3
-  beta: 0.5
+  beta: 0.3              # softer adversary on small data
   pos_weight: 2.0
+
+train:
+  epochs: 40
+  lr: 5.0e-4
+  batch_bags: 8
+  patience: 8
+  weight_decay: 1.0e-4   # stronger regularisation
+
+calib:
+  method: platt          # more reliable than isotonic on tiny inner-val
+  threshold: fixed       # 0.5 after calibration (stable; avoids Youden noise)
 
 cv:
   n_folds: 5

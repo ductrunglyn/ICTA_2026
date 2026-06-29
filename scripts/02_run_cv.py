@@ -16,6 +16,7 @@ import sys
 from pathlib import Path
 from typing import Dict
 
+import numpy as np
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -121,6 +122,17 @@ def main() -> None:
     n_groups = builder.n_groups()
     n_corpus = int(builder.manifest["corpus_id"].max()) + 1
 
+    # Acoustic input dim is inferred from the cached features (e.g. 79 for
+    # COVAREP, 25 for openSMILE eGeMAPS) so the encoder matches the data.
+    in_dims = None
+    sample = builder.build(list(builder.manifest.index[:1]))
+    if sample:
+        for seg in sample[0].segments:
+            ac = seg.get("acoustic")
+            if ac is not None:
+                in_dims = {"acoustic": int(np.asarray(ac).shape[-1])}
+                break
+
     def model_factory() -> TransValNet:
         return TransValNet(
             d=cfg.model.d,
@@ -128,6 +140,8 @@ def main() -> None:
             n_gender=cfg.model.n_gender,
             use_adv=cfg.model.use_adv,
             use_visual=cfg.model.use_visual,
+            dropout=float(cfg.model.get("dropout", 0.0)),
+            in_dims=in_dims,
         )
 
     trainer_cfg, cv_cfg = build_configs(cfg)

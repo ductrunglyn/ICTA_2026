@@ -27,6 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from src.data.features import (  # noqa: E402
     AudioFeatureExtractor,
     FeatureCache,
+    OpenSmileAcousticExtractor,
     TextFeatureExtractor,
     build_segment_feature,
     load_acoustic_csv,
@@ -59,6 +60,7 @@ def process_participant(
     text_fx: TextFeatureExtractor,
     extract_audio: bool,
     overwrite: bool = False,
+    acoustic_smile: "OpenSmileAcousticExtractor | None" = None,
 ) -> List[Dict[str, object]]:
     """Segment + feature-extract a single participant. Returns segment rows.
 
@@ -125,12 +127,25 @@ def process_participant(
                 text_arr = text_fx.extract(seg.text)
             except Exception as exc:  # pragma: no cover - external model
                 logger.debug("Text features skipped for %s: %s", seg.seg_id, exc)
-        if extract_audio and audio_path and Path(audio_path).exists():
+
+        # Load the waveform slice once if any audio-derived feature is needed.
+        need_wave = (extract_audio or acoustic_smile is not None)
+        wav = None
+        if need_wave and audio_path and Path(audio_path).exists():
             try:
                 wav = load_audio_slice(audio_path, seg.start_s, seg.end_s)
+            except Exception as exc:  # pragma: no cover - external audio
+                logger.debug("Audio load failed for %s: %s", seg.seg_id, exc)
+        if extract_audio and wav is not None:
+            try:
                 audio_arr = audio_fx.extract(wav)
-            except Exception as exc:  # pragma: no cover - external model/audio
+            except Exception as exc:  # pragma: no cover - external model
                 logger.debug("Audio features skipped for %s: %s", seg.seg_id, exc)
+        if acoustic_smile is not None and wav is not None:
+            try:
+                acoustic_arr = acoustic_smile.extract(wav)  # overrides COVAREP
+            except Exception as exc:  # pragma: no cover - external model
+                logger.debug("openSMILE features skipped for %s: %s", seg.seg_id, exc)
 
         feat = build_segment_feature(
             seg, corpus=corpus, gender=int(row.get("gender", 0)),
@@ -165,6 +180,12 @@ def main() -> None:
                          "Defaults to cuda if available, else cpu.")
     ap.add_argument("--overwrite", action="store_true",
                     help="Recompute features even if a segment is already cached.")
+    ap.add_argument("--acoustic_backend", default="none",
+                    choices=["none", "opensmile"],
+                    help="Acoustic branch source. 'opensmile' extracts eGeMAPS "
+                         "LLDs from raw audio (when COVAREP is unavailable).")
+    ap.add_argument("--opensmile_set", default="eGeMAPSv02",
+                    choices=["eGeMAPSv02", "ComParE_2016"])
     args = ap.parse_args()
 
     manifest = pd.read_csv(args.manifest)
@@ -183,6 +204,13 @@ def main() -> None:
 
     audio_fx = AudioFeatureExtractor(model_name=cfg.backbones.audio, device=device)
     text_fx = TextFeatureExtractor(model_name=cfg.backbones.text, device=device)
+    acoustic_smile = (
+        OpenSmileAcousticExtractor(feature_set=args.opensmile_set)
+        if args.acoustic_backend == "opensmile" else None
+    )
+    if acoustic_smile is not None:
+        logger.info("Acoustic backend: openSMILE %s (dim=%d)",
+                    args.opensmile_set, acoustic_smile.dim)
 
     # Map corpus name -> spec.
     spec_by_corpus = {spec.get("corpus", name): spec for name, spec in corpora.items()}
@@ -196,7 +224,7 @@ def main() -> None:
             continue
         rows = process_participant(
             row, spec, prompt_map, cache, audio_fx, text_fx, args.extract_audio,
-            overwrite=args.overwrite,
+            overwrite=args.overwrite, acoustic_smile=acoustic_smile,
         )
         all_segment_rows.extend(rows)
         seg_counts[row["participant_id"]] = len(rows)
@@ -208,7 +236,21 @@ def main() -> None:
     # Update n_segments in the participant manifest.
     manifest["n_segments"] = manifest["participant_id"].map(seg_counts).fillna(0).astype(int)
     manifest.to_csv(args.manifest, index=False)
-    logger.info("Cached %d segments for %d participants", len(seg_df), len(manifest))
+
+    # --- Coverage report (diagnoses the "only N/Total participants used" issue) ---
+    with_seg = int((manifest["n_segments"] > 0).sum())
+    zero = manifest.loc[manifest["n_segments"] == 0, "participant_id"].tolist()
+    logger.info("Cached %d segments | participants WITH segments: %d / %d",
+                len(seg_df), with_seg, len(manifest))
+    if zero:
+        logger.warning(
+            "%d participants have ZERO segments (dropped from CV). First 20: %s",
+            len(zero), zero[:20],
+        )
+        logger.warning(
+            "Likely causes: missing transcript/audio file, or all answers < 3s "
+            "(MIN_SEG_S). Check that each participant has a data folder + transcript."
+        )
 
 
 if __name__ == "__main__":

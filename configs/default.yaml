@@ -1,6 +1,7 @@
 # TransVal-Dep base hyper-parameters (source-of-truth = TransValDep_Design.md §10).
 model:
   d: 128
+  dropout: 0.0
   use_adv: true
   use_group_dro: true
   use_irm: false

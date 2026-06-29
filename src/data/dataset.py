@@ -108,6 +108,16 @@ def collate_bags(bags: Sequence[Bag]) -> Dict[str, torch.Tensor]:
     bag_labels: List[int] = []
     group_ids: List[int] = []
 
+    # Infer the real feature dim of each sequence modality from any present
+    # array (so e.g. openSMILE acoustic dims work without editing constants).
+    seq_dims: Dict[str, int] = dict(MODALITY_DIM)
+    for bag in bags:
+        for seg in bag.segments:
+            for m in SEQ_MODALITIES:
+                val = seg.get(m)
+                if val is not None:
+                    seq_dims[m] = int(np.asarray(val).shape[-1])
+
     for b_idx, bag in enumerate(bags):
         bag_labels.append(int(bag.label))
         group_ids.append(int(bag.group_id))
@@ -117,7 +127,7 @@ def collate_bags(bags: Sequence[Bag]) -> Dict[str, torch.Tensor]:
                 val = seg.get(m)
                 present.append(1.0 if val is not None else 0.0)
                 if m in SEQ_MODALITIES:
-                    seq_lists[m].append(_to_seq_tensor(val, MODALITY_DIM[m]))
+                    seq_lists[m].append(_to_seq_tensor(val, seq_dims[m]))
             txt = seg.get("text")
             if txt is None:
                 text_list.append(torch.zeros(TEXT_DIM, dtype=torch.float32))

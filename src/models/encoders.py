@@ -50,9 +50,10 @@ class ModalityEncoder(nn.Module):
             otherwise as ``(N,in_dim)``.
     """
 
-    def __init__(self, in_dim: int, d: int, seq: bool = True) -> None:
+    def __init__(self, in_dim: int, d: int, seq: bool = True, dropout: float = 0.0) -> None:
         super().__init__()
         self.seq = seq
+        self.drop = nn.Dropout(dropout)
         if seq:
             self.rnn = nn.LSTM(in_dim, d // 2, batch_first=True, bidirectional=True)
             self.pool = AttentionPool(d, d)
@@ -65,8 +66,8 @@ class ModalityEncoder(nn.Module):
         """Return ``(N, d)`` embeddings."""
         if self.seq:
             h, _ = self.rnn(x)            # (N, T, d)
-            return self.pool(h, mask)     # (N, d)
-        return self.mlp(x)               # (N, d)
+            return self.drop(self.pool(h, mask))     # (N, d)
+        return self.drop(self.mlp(x))    # (N, d)
 
 
 def pool_segments_to_bags(

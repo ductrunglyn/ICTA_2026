@@ -45,20 +45,28 @@ class TransValNet(nn.Module):
         n_gender: int = 2,
         use_adv: bool = True,
         use_visual: bool = True,
+        dropout: float = 0.0,
+        in_dims: Optional[Dict[str, int]] = None,
     ) -> None:
         super().__init__()
         self.d = d
         self.use_visual = use_visual
+        # Per-modality input dims (override e.g. acoustic for openSMILE eGeMAPS).
+        dims = dict(IN_DIMS)
+        if in_dims:
+            dims.update(in_dims)
+        self.in_dims = dims
         self.enc = nn.ModuleDict(
             {
-                "audio": ModalityEncoder(IN_DIMS["audio"], d, seq=True),
-                "acoustic": ModalityEncoder(IN_DIMS["acoustic"], d, seq=True),
-                "text": ModalityEncoder(IN_DIMS["text"], d, seq=False),
-                "visual": ModalityEncoder(IN_DIMS["visual"], d, seq=True),
+                "audio": ModalityEncoder(dims["audio"], d, seq=True, dropout=dropout),
+                "acoustic": ModalityEncoder(dims["acoustic"], d, seq=True, dropout=dropout),
+                "text": ModalityEncoder(dims["text"], d, seq=False, dropout=dropout),
+                "visual": ModalityEncoder(dims["visual"], d, seq=True, dropout=dropout),
             }
         )
         self.fuse = nn.Sequential(
-            nn.Linear(len(MODALITY_ORDER) * d, d), nn.GELU(), nn.LayerNorm(d)
+            nn.Linear(len(MODALITY_ORDER) * d, d), nn.GELU(), nn.LayerNorm(d),
+            nn.Dropout(dropout),
         )
         self.bag_attn = nn.Linear(d, 1)
         self.dep_seg = DepressionHead(d)

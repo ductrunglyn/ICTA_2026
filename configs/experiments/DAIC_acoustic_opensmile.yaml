@@ -1,0 +1,40 @@
+# E0-style baseline for DAIC: acoustic-only via openSMILE eGeMAPS LLDs.
+# Tests the "acoustic dominance" hypothesis — the mandatory reference everything
+# else must beat. Requires features extracted with --acoustic_backend opensmile.
+#
+# Run extraction first:
+#   python scripts/01_extract_features.py --manifest data/manifests/all.csv \
+#       --acoustic_backend opensmile --device cuda
+# Then:
+#   python scripts/02_run_cv.py --experiment configs/experiments/DAIC_acoustic_opensmile.yaml \
+#       --modalities acoustic
+model:
+  d: 64
+  dropout: 0.3
+  use_adv: true
+  use_group_dro: true
+  use_irm: false
+  use_visual: false
+  n_gender: 2
+
+loss:
+  alpha: 0.3
+  beta: 0.3
+  pos_weight: 2.0
+
+train:
+  epochs: 40
+  lr: 5.0e-4
+  batch_bags: 8
+  patience: 8
+  weight_decay: 1.0e-4
+
+calib:
+  method: platt
+  threshold: fixed
+
+cv:
+  n_folds: 5
+  seeds: [0, 1, 2, 3, 4]
+  mode: pooled
+  exp_name: daic_acoustic_opensmile

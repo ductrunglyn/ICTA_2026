@@ -197,6 +197,56 @@ def load_audio_slice(
     return sl
 
 
+class OpenSmileAcousticExtractor:
+    """Frame-level acoustic LLDs via openSMILE (eGeMAPS by default).
+
+    Replaces COVAREP when only raw audio is available. eGeMAPSv02 yields 25
+    low-level descriptors per frame; ComParE_2016 yields 65. The chosen set's
+    dimension must match the model's ``acoustic`` encoder ``in_dim``.
+
+    Args:
+        feature_set: ``eGeMAPSv02`` (25-d) or ``ComParE_2016`` (65-d).
+        sample_rate: Expected sample rate of the sliced waveform.
+    """
+
+    DIMS = {"eGeMAPSv02": 25, "ComParE_2016": 65}
+
+    def __init__(self, feature_set: str = "eGeMAPSv02", sample_rate: int = 16000) -> None:
+        self.feature_set = feature_set
+        self.sample_rate = sample_rate
+        self._smile = None
+
+    @property
+    def dim(self) -> int:
+        return self.DIMS.get(self.feature_set, 25)
+
+    def _lazy_init(self) -> None:
+        if self._smile is not None:
+            return
+        try:
+            import opensmile
+        except ImportError as exc:  # pragma: no cover - external dependency
+            raise ImportError(
+                "openSMILE acoustic features need 'opensmile' "
+                "(`pip install opensmile`)."
+            ) from exc
+        self._smile = opensmile.Smile(
+            feature_set=getattr(opensmile.FeatureSet, self.feature_set),
+            feature_level=opensmile.FeatureLevel.LowLevelDescriptors,
+        )
+
+    def extract(self, waveform: np.ndarray) -> np.ndarray:
+        """Return a ``(T, dim)`` z-scored LLD sequence for a waveform slice."""
+        self._lazy_init()
+        sig = np.asarray(waveform, dtype=np.float32)
+        df = self._smile.process_signal(sig, self.sample_rate)
+        arr = df.to_numpy().astype(np.float32)
+        if arr.shape[0] == 0:
+            arr = np.zeros((1, self.dim), dtype=np.float32)
+        mu, sigma = arr.mean(0, keepdims=True), arr.std(0, keepdims=True) + 1e-6
+        return ((arr - mu) / sigma).astype(np.float32)
+
+
 def load_visual_txt(
     path: Union[str, Path],
     start_s: float,
