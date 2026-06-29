@@ -158,8 +158,11 @@ def load_audio_slice(
 ) -> np.ndarray:
     """Load a mono waveform slice ``[start_s, end_s)`` resampled to ``sample_rate``.
 
-    Tries ``torchaudio`` first, then ``soundfile``. The returned 1-D float32
-    array is what :meth:`AudioFeatureExtractor.extract` expects.
+    Decoders are tried in order of robustness: ``soundfile`` (libsndfile, reads
+    DAIC 16 kHz wavs directly), then ``torchaudio``, then ``librosa``. Any
+    decoder error (e.g. torchaudio "Couldn't find appropriate backend") falls
+    through to the next, so a missing torchaudio backend no longer silently
+    yields empty audio. Resampling uses librosa/scipy when needed.
 
     Args:
         path: Path to a wav file.
@@ -168,33 +171,88 @@ def load_audio_slice(
 
     Returns:
         1-D ``float32`` waveform for the requested span.
-    """
-    try:
-        import torch  # noqa: F401
-        import torchaudio
 
-        wav, sr = torchaudio.load(str(path))           # (channels, n)
-        if wav.size(0) > 1:
-            wav = wav.mean(0, keepdim=True)            # to mono
-        if sr != sample_rate:
-            wav = torchaudio.functional.resample(wav, sr, sample_rate)
-        wav = wav.squeeze(0).numpy()
-    except ImportError:
+    Raises:
+        RuntimeError: If no available decoder can read the file.
+    """
+    path = str(path)
+    wav = None
+    sr = None
+    errors = []
+
+    # 1) soundfile (most reliable for PCM wav).
+    try:
         import soundfile as sf  # type: ignore
 
-        wav, sr = sf.read(str(path), dtype="float32")
-        if wav.ndim > 1:
-            wav = wav.mean(axis=1)
-        if sr != sample_rate:  # pragma: no cover - depends on input rate
-            raise ValueError(
-                f"{path}: sample rate {sr} != {sample_rate} and torchaudio is "
-                "unavailable for resampling."
-            )
+        wav, sr = sf.read(path, dtype="float32")
+        if np.ndim(wav) > 1:
+            wav = np.mean(wav, axis=1)
+    except Exception as exc:  # noqa: BLE001 - try the next backend
+        errors.append(f"soundfile: {exc}")
+        wav = None
+
+    # 2) torchaudio.
+    if wav is None:
+        try:
+            import torchaudio
+
+            w, sr = torchaudio.load(path)
+            if w.size(0) > 1:
+                w = w.mean(0, keepdim=True)
+            wav = w.squeeze(0).numpy()
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"torchaudio: {exc}")
+            wav = None
+
+    # 3) librosa (also resamples directly).
+    if wav is None:
+        try:
+            import librosa  # type: ignore
+
+            wav, sr = librosa.load(path, sr=sample_rate, mono=True)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"librosa: {exc}")
+            wav = None
+
+    if wav is None:
+        raise RuntimeError(
+            f"No audio backend could read {path}. Install one of "
+            "'soundfile' / 'librosa', or an ffmpeg backend for torchaudio. "
+            f"Tried -> {' | '.join(errors)}"
+        )
+
+    wav = np.asarray(wav, dtype=np.float32)
+    if sr is not None and sr != sample_rate:
+        wav = _resample(wav, int(sr), sample_rate)
+
     i0, i1 = int(start_s * sample_rate), int(end_s * sample_rate)
     sl = np.asarray(wav[i0:i1], dtype=np.float32)
     if sl.shape[0] == 0:
         sl = np.zeros(sample_rate // 10, dtype=np.float32)  # 0.1s of silence
     return sl
+
+
+def _resample(wav: np.ndarray, sr: int, target_sr: int) -> np.ndarray:
+    """Resample a 1-D waveform to ``target_sr`` (librosa -> scipy -> linear)."""
+    if sr == target_sr:
+        return wav
+    try:
+        import librosa  # type: ignore
+
+        return librosa.resample(wav.astype(np.float64), orig_sr=sr, target_sr=target_sr).astype(np.float32)
+    except Exception:  # noqa: BLE001
+        try:
+            from scipy.signal import resample_poly
+
+            from math import gcd
+
+            g = gcd(sr, target_sr)
+            return resample_poly(wav, target_sr // g, sr // g).astype(np.float32)
+        except Exception:  # noqa: BLE001 - last resort: linear interpolation
+            n = int(round(len(wav) * target_sr / sr))
+            xp = np.linspace(0, 1, len(wav), endpoint=False)
+            x = np.linspace(0, 1, n, endpoint=False)
+            return np.interp(x, xp, wav).astype(np.float32)
 
 
 class OpenSmileAcousticExtractor:
