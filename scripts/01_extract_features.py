@@ -58,6 +58,7 @@ def process_participant(
     audio_fx: AudioFeatureExtractor,
     text_fx: TextFeatureExtractor,
     extract_audio: bool,
+    overwrite: bool = False,
 ) -> List[Dict[str, object]]:
     """Segment + feature-extract a single participant. Returns segment rows.
 
@@ -96,6 +97,19 @@ def process_participant(
     rows: List[Dict[str, object]] = []
 
     for seg in segments:
+        # Resume support: skip segments already cached unless --overwrite.
+        if not overwrite and cache.exists(seg.seg_id):
+            rows.append(
+                {
+                    "participant_id": pid,
+                    "seg_id": seg.seg_id,
+                    "qtype": seg.qtype_id,
+                    "start_s": seg.start_s,
+                    "end_s": seg.end_s,
+                }
+            )
+            continue
+
         audio_arr = acoustic_arr = visual_arr = text_arr = None
 
         if acoustic_path:
@@ -146,6 +160,11 @@ def main() -> None:
     ap.add_argument("--config", default="configs/default.yaml")
     ap.add_argument("--extract_audio", action="store_true",
                     help="Run the (heavy) audio backbone; off by default.")
+    ap.add_argument("--device", default=None,
+                    help="Torch device for backbones (e.g. cuda, cuda:0, cpu). "
+                         "Defaults to cuda if available, else cpu.")
+    ap.add_argument("--overwrite", action="store_true",
+                    help="Recompute features even if a segment is already cached.")
     args = ap.parse_args()
 
     manifest = pd.read_csv(args.manifest)
@@ -154,8 +173,16 @@ def main() -> None:
     prompt_map = _load_prompt_map()
     cache = FeatureCache(args.cache_dir)
 
-    audio_fx = AudioFeatureExtractor(model_name=cfg.backbones.audio)
-    text_fx = TextFeatureExtractor(model_name=cfg.backbones.text)
+    if args.device:
+        device = args.device
+    else:
+        import torch
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    logger.info("Extracting features on device: %s", device)
+
+    audio_fx = AudioFeatureExtractor(model_name=cfg.backbones.audio, device=device)
+    text_fx = TextFeatureExtractor(model_name=cfg.backbones.text, device=device)
 
     # Map corpus name -> spec.
     spec_by_corpus = {spec.get("corpus", name): spec for name, spec in corpora.items()}
@@ -168,7 +195,8 @@ def main() -> None:
             logger.warning("No corpus spec for %s", row["corpus"])
             continue
         rows = process_participant(
-            row, spec, prompt_map, cache, audio_fx, text_fx, args.extract_audio
+            row, spec, prompt_map, cache, audio_fx, text_fx, args.extract_audio,
+            overwrite=args.overwrite,
         )
         all_segment_rows.extend(rows)
         seg_counts[row["participant_id"]] = len(rows)
