@@ -40,6 +40,19 @@ from src.utils.logging import get_logger  # noqa: E402
 
 logger = get_logger("extract_features")
 
+# Budget so repeated failures surface loudly a few times instead of silently.
+_WARN_BUDGET: Dict[str, int] = {}
+
+
+def _warn_once(key: str, msg: str, *args, budget: int = 5) -> None:
+    """Emit a warning up to ``budget`` times per key, then go quiet."""
+    n = _WARN_BUDGET.get(key, budget)
+    if n > 0:
+        logger.warning(msg, *args)
+        _WARN_BUDGET[key] = n - 1
+        if n == 1:
+            logger.warning("(further '%s' warnings suppressed)", key)
+
 
 def _load_prompt_map(path: str = "configs/prompt2qtype.yaml") -> Dict[str, str]:
     cfg = load_config(path)
@@ -131,16 +144,20 @@ def process_participant(
         # Load the waveform slice once if any audio-derived feature is needed.
         need_wave = (extract_audio or acoustic_smile is not None)
         wav = None
-        if need_wave and audio_path and Path(audio_path).exists():
-            try:
-                wav = load_audio_slice(audio_path, seg.start_s, seg.end_s)
-            except Exception as exc:  # pragma: no cover - external audio
-                logger.debug("Audio load failed for %s: %s", seg.seg_id, exc)
+        if need_wave:
+            if not audio_path or not Path(audio_path).exists():
+                _warn_once("audio_path", "Audio file missing for %s: %s", pid, audio_path)
+            else:
+                try:
+                    wav = load_audio_slice(audio_path, seg.start_s, seg.end_s)
+                except Exception as exc:  # pragma: no cover - external audio
+                    _warn_once("audio_load", "Audio load failed for %s: %s", seg.seg_id, exc)
         if extract_audio and wav is not None:
             try:
                 audio_arr = audio_fx.extract(wav)
             except Exception as exc:  # pragma: no cover - external model
-                logger.debug("Audio features skipped for %s: %s", seg.seg_id, exc)
+                _warn_once("audio_fx", "Audio feature extraction failed for %s: %s",
+                           seg.seg_id, exc)
         if acoustic_smile is not None and wav is not None:
             try:
                 acoustic_arr = acoustic_smile.extract(wav)  # overrides COVAREP
@@ -250,6 +267,27 @@ def main() -> None:
         logger.warning(
             "Likely causes: missing transcript/audio file, or all answers < 3s "
             "(MIN_SEG_S). Check that each participant has a data folder + transcript."
+        )
+
+    # --- Per-modality coverage (diagnoses 'audio is empty in cache') ---
+    counts = {m: 0 for m in ("audio", "acoustic", "text", "visual")}
+    for sid in seg_df["seg_id"] if not seg_df.empty else []:
+        try:
+            feat = cache.load(sid)
+        except Exception:  # pragma: no cover - corrupt cache entry
+            continue
+        for m in counts:
+            if feat.get(m) is not None:
+                counts[m] += 1
+    total = len(seg_df)
+    logger.info("Modality coverage (segments with non-None feature):")
+    for m, c in counts.items():
+        pct = 100.0 * c / total if total else 0.0
+        logger.info("  %-9s %d / %d (%.1f%%)", m, c, total, pct)
+    if counts["audio"] == 0 and total:
+        logger.warning(
+            "AUDIO is empty in the cache. Re-run with '--extract_audio --overwrite' "
+            "(and --device cuda). Check the warnings above for the root cause."
         )
 
 
