@@ -82,6 +82,9 @@ def main() -> None:
     ap.add_argument("--cache_dir", default="data/interim/features")
     ap.add_argument("--modalities", default=None,
                     help="Comma-separated modality subset, e.g. 'acoustic' for E0.")
+    ap.add_argument("--device", default=None,
+                    help="Torch device for training (cuda, cuda:0, cpu). "
+                         "Overrides train.device; defaults to cuda if available.")
     args = ap.parse_args()
 
     base = load_config(args.config).to_dict()
@@ -93,6 +96,16 @@ def main() -> None:
     from src.utils.config import Config
 
     cfg = Config(merged)
+
+    # Resolve training device (CLI override > config > auto-detect).
+    if args.device:
+        cfg.train.device = args.device
+    elif cfg.train.device == "cpu":
+        import torch
+
+        if torch.cuda.is_available():
+            cfg.train.device = "cuda"
+    logger.info("Training device: %s", cfg.train.device)
 
     manifest = pd.read_csv(args.manifest)
     segments = pd.read_csv(args.segments)
