@@ -111,19 +111,42 @@ def process_participant(
     visual_path = spec.get("visual")
     rows: List[Dict[str, object]] = []
 
+    def _row(seg) -> Dict[str, object]:
+        return {
+            "participant_id": pid,
+            "seg_id": seg.seg_id,
+            "qtype": seg.qtype_id,
+            "start_s": seg.start_s,
+            "end_s": seg.end_s,
+        }
+
+    # Modalities we are able to produce in this run (used by the smart resume).
+    acoustic_available = (
+        acoustic_smile is not None
+        or (acoustic_path and Path(_resolve(str(acoustic_path), pid_local)).exists())
+    )
+    visual_available = bool(
+        visual_path and Path(_resolve(str(visual_path), pid_local)).exists()
+    )
+
     for seg in segments:
-        # Resume support: skip segments already cached unless --overwrite.
+        # Smart resume: skip only if every modality we could add is already
+        # cached. Otherwise recompute so newly-enabled modalities (e.g. audio)
+        # get filled in without needing --overwrite.
         if not overwrite and cache.exists(seg.seg_id):
-            rows.append(
-                {
-                    "participant_id": pid,
-                    "seg_id": seg.seg_id,
-                    "qtype": seg.qtype_id,
-                    "start_s": seg.start_s,
-                    "end_s": seg.end_s,
-                }
-            )
-            continue
+            cached = cache.load(seg.seg_id)
+            want = set()
+            if seg.text:
+                want.add("text")
+            if extract_audio:
+                want.add("audio")
+            if acoustic_available:
+                want.add("acoustic")
+            if visual_available:
+                want.add("visual")
+            if all(cached.get(m) is not None for m in want):
+                rows.append(_row(seg))
+                continue
 
         audio_arr = acoustic_arr = visual_arr = text_arr = None
 
@@ -171,15 +194,7 @@ def process_participant(
             visual_arr=visual_arr, text_arr=text_arr,
         )
         cache.save(seg.seg_id, feat)
-        rows.append(
-            {
-                "participant_id": pid,
-                "seg_id": seg.seg_id,
-                "qtype": seg.qtype_id,
-                "start_s": seg.start_s,
-                "end_s": seg.end_s,
-            }
-        )
+        rows.append(_row(seg))
     return rows
 
 
