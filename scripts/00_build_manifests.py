@@ -124,10 +124,33 @@ def build_for_corpus(name: str, spec) -> pd.DataFrame:
     return out
 
 
+def _has_data(participant_id: str, corpus: str, corpora) -> bool:
+    """Return True if the participant has an audio or transcript file on disk."""
+    spec = None
+    for _, s in corpora.items():
+        if s.get("corpus") == corpus:
+            spec = s
+            break
+    if spec is None:
+        return True  # unknown corpus -> don't filter
+    pid_local = participant_id.split("_", 1)[1] if "_" in participant_id else participant_id
+    for key in ("audio_dir", "transcript"):
+        tmpl = spec.get(key)
+        if tmpl:
+            if Path(str(tmpl).replace("{pid}", pid_local)).exists():
+                return True
+    return False
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--corpora", default="configs/corpora.yaml")
     ap.add_argument("--out", default="data/manifests/all.csv")
+    ap.add_argument("--require-data", dest="require_data", action="store_true",
+                    default=True,
+                    help="Keep only participants whose audio/transcript exists "
+                         "(default: on). Use --no-require-data to keep all rows.")
+    ap.add_argument("--no-require-data", dest="require_data", action="store_false")
     args = ap.parse_args()
 
     corpora = load_config(args.corpora)
@@ -146,10 +169,29 @@ def main() -> None:
         manifest = pd.concat(frames, ignore_index=True)
         manifest = add_corpus_id(manifest)
 
+    n_labelled = len(manifest)
+    if args.require_data and not manifest.empty:
+        mask = manifest.apply(
+            lambda r: _has_data(r["participant_id"], r["corpus"], corpora), axis=1
+        )
+        dropped = manifest.loc[~mask, "participant_id"].tolist()
+        manifest = manifest.loc[mask].reset_index(drop=True)
+        if dropped:
+            logger.warning(
+                "Dropped %d/%d labelled participants with NO data folder "
+                "(download the rest of the corpus to include them). First 10: %s",
+                len(dropped), n_labelled, dropped[:10],
+            )
+
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     manifest.to_csv(out, index=False)
-    logger.info("Wrote %d participants to %s", len(manifest), out)
+    logger.info("Wrote %d participants to %s (labelled in splits: %d)",
+                len(manifest), out, n_labelled)
+    if not manifest.empty:
+        pos = int(manifest["label"].sum())
+        logger.info("Class balance: %d positive / %d total (%.1f%%)",
+                    pos, len(manifest), 100.0 * pos / len(manifest))
 
 
 if __name__ == "__main__":
