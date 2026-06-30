@@ -175,6 +175,22 @@ def load_audio_slice(
     Raises:
         RuntimeError: If no available decoder can read the file.
     """
+    wav = load_full_audio(path, sample_rate)
+    return slice_waveform(wav, start_s, end_s, sample_rate)
+
+
+def load_full_audio(path: Union[str, Path], sample_rate: int = 16000) -> np.ndarray:
+    """Decode a whole file to a 1-D mono ``float32`` waveform at ``sample_rate``.
+
+    Load this once per participant and reuse :func:`slice_waveform` for each
+    segment (decoding the full file per segment is wasteful at scale).
+
+    Decoders are tried in order of robustness: ``soundfile`` -> ``torchaudio``
+    -> ``librosa``. Any decoder error falls through to the next.
+
+    Raises:
+        RuntimeError: If no available decoder can read the file.
+    """
     path = str(path)
     wav = None
     sr = None
@@ -224,11 +240,17 @@ def load_audio_slice(
     wav = np.asarray(wav, dtype=np.float32)
     if sr is not None and sr != sample_rate:
         wav = _resample(wav, int(sr), sample_rate)
+    return wav
 
+
+def slice_waveform(
+    wav: np.ndarray, start_s: float, end_s: float, sample_rate: int = 16000
+) -> np.ndarray:
+    """Slice ``[start_s, end_s)`` from an in-memory waveform (0.1s silence if empty)."""
     i0, i1 = int(start_s * sample_rate), int(end_s * sample_rate)
     sl = np.asarray(wav[i0:i1], dtype=np.float32)
     if sl.shape[0] == 0:
-        sl = np.zeros(sample_rate // 10, dtype=np.float32)  # 0.1s of silence
+        sl = np.zeros(sample_rate // 10, dtype=np.float32)
     return sl
 
 

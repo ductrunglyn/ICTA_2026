@@ -31,8 +31,9 @@ from src.data.features import (  # noqa: E402
     TextFeatureExtractor,
     build_segment_feature,
     load_acoustic_csv,
-    load_audio_slice,
+    load_full_audio,
     load_visual_txt,
+    slice_waveform,
 )
 from src.data.segmentation import Segment, segment_participant  # noqa: E402
 from src.utils.config import load_config  # noqa: E402
@@ -129,6 +130,18 @@ def process_participant(
         visual_path and Path(_resolve(str(visual_path), pid_local)).exists()
     )
 
+    # Decode the participant's waveform ONCE (not per segment) for efficiency.
+    need_wave = (extract_audio or acoustic_smile is not None)
+    full_wave = None
+    if need_wave:
+        if not audio_path or not Path(audio_path).exists():
+            _warn_once("audio_path", "Audio file missing for %s: %s", pid, audio_path)
+        else:
+            try:
+                full_wave = load_full_audio(audio_path)
+            except Exception as exc:  # pragma: no cover - external audio
+                _warn_once("audio_load", "Audio load failed for %s: %s", pid, exc)
+
     for seg in segments:
         # Smart resume: skip only if every modality we could add is already
         # cached. Otherwise recompute so newly-enabled modalities (e.g. audio)
@@ -164,17 +177,10 @@ def process_participant(
             except Exception as exc:  # pragma: no cover - external model
                 logger.debug("Text features skipped for %s: %s", seg.seg_id, exc)
 
-        # Load the waveform slice once if any audio-derived feature is needed.
-        need_wave = (extract_audio or acoustic_smile is not None)
+        # Slice the pre-decoded participant waveform for this segment.
         wav = None
-        if need_wave:
-            if not audio_path or not Path(audio_path).exists():
-                _warn_once("audio_path", "Audio file missing for %s: %s", pid, audio_path)
-            else:
-                try:
-                    wav = load_audio_slice(audio_path, seg.start_s, seg.end_s)
-                except Exception as exc:  # pragma: no cover - external audio
-                    _warn_once("audio_load", "Audio load failed for %s: %s", seg.seg_id, exc)
+        if full_wave is not None:
+            wav = slice_waveform(full_wave, seg.start_s, seg.end_s)
         if extract_audio and wav is not None:
             try:
                 audio_arr = audio_fx.extract(wav)
