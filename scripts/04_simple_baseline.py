@@ -1,21 +1,29 @@
 #!/usr/bin/env python
-"""Simple participant-level baseline: pooled features + Logistic Regression.
+"""Simple participant-level baseline: pooled features + regularised classifier.
 
-This is the mandatory reference (E0-style) that the deep model must beat, and a
-*diagnostic*: on very small datasets a regularised linear model over
-participant-level pooled features is often stronger than a deep MIL network. If
-this baseline is also near chance, the bottleneck is the data, not the model.
+The mandatory reference (E0-style) the deep model must beat, and a diagnostic.
+At n~=56 with thousands of pooled features the bottleneck is the curse of
+dimensionality, so this baseline adds the levers that actually matter for small
+data:
 
-Per participant, every modality is pooled to a fixed vector:
-  segment frames --(mean over time)--> per-segment vector
-  per-segment vectors --(mean & std over segments)--> participant vector
-Available modality vectors are concatenated (missing modalities -> zeros).
-Evaluation uses the same :class:`LeakageFreeSplitter` (5-fold x multi-seed),
-participant-level, with bootstrap CIs.
+* **Dimensionality reduction** (``--pca K``) before the classifier.
+* **Automatic L2 strength** selection (``--C auto``) via inner stratified CV.
+* **L1 / L2** penalties (``--penalty``).
+* **Probability calibration** on an inner split (``--calibrate``).
+* **Late fusion** (``--fusion late``): train one classifier per modality and
+  average their (optionally calibrated) probabilities — robust when one modality
+  (audio) is noisy and would otherwise swamp a strong one (text) in early
+  concatenation.
+
+Per participant each modality is pooled to ``[mean || std]`` over segments
+(after mean-over-time per segment). Evaluation uses the leakage-free
+:class:`LeakageFreeSplitter` (K-fold x multi-seed) with bootstrap CIs.
 
 Usage:
-    python scripts/04_simple_baseline.py --manifest data/manifests/all.csv \
-        --segments data/manifests/segments.csv --modalities audio,text
+    python scripts/04_simple_baseline.py --modalities text --C auto --pca 30 \
+        --calibrate --exp_name baseline_text
+    python scripts/04_simple_baseline.py --modalities audio,text --fusion late \
+        --C auto --pca 30 --calibrate --exp_name baseline_latefusion
 """
 
 from __future__ import annotations
@@ -24,14 +32,13 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.data.dataset import MODALITY_ORDER  # noqa: E402
 from src.data.features import FeatureCache  # noqa: E402
 from src.data.splitter import LeakageFreeSplitter, add_corpus_id  # noqa: E402
 from src.eval.metrics import compute_all_metrics  # noqa: E402
@@ -41,27 +48,18 @@ from src.utils.seed import set_seed  # noqa: E402
 
 logger = get_logger("simple_baseline")
 
+C_GRID = [0.001, 0.01, 0.1, 1.0, 10.0]
+
 
 def _pool_segment(arr: np.ndarray) -> np.ndarray:
-    """Pool one segment's array to a vector (mean over time if 2-D)."""
     a = np.asarray(arr, dtype=np.float64)
     return a.mean(axis=0) if a.ndim == 2 else a
 
 
-def _participant_vector(
+def _modality_vectors(
     seg_ids: List[str], cache: FeatureCache, dims: Dict[str, int], modalities: List[str]
-) -> np.ndarray:
-    """Build a fixed-length pooled vector for one participant.
-
-    Args:
-        seg_ids: Segment ids belonging to the participant.
-        cache: Feature cache.
-        dims: Per-modality per-segment pooled dim (global, for zero-fill).
-        modalities: Modalities to include.
-
-    Returns:
-        Concatenated ``[mean || std]`` vector across modalities.
-    """
+) -> Dict[str, np.ndarray]:
+    """Per-modality ``[mean || std]`` participant vector (zeros if absent)."""
     per_mod: Dict[str, List[np.ndarray]] = {m: [] for m in modalities}
     for sid in seg_ids:
         feat = cache.load(sid)
@@ -69,23 +67,18 @@ def _participant_vector(
             val = feat.get(m)
             if val is not None:
                 per_mod[m].append(_pool_segment(val))
-    parts: List[np.ndarray] = []
+    out: Dict[str, np.ndarray] = {}
     for m in modalities:
         d = dims[m]
         if per_mod[m]:
-            stack = np.stack(per_mod[m], axis=0)        # (n_seg, d)
-            parts.append(stack.mean(axis=0))
-            parts.append(stack.std(axis=0))
+            stack = np.stack(per_mod[m], axis=0)
+            out[m] = np.concatenate([stack.mean(0), stack.std(0)])
         else:
-            parts.append(np.zeros(d))
-            parts.append(np.zeros(d))
-    return np.concatenate(parts)
+            out[m] = np.zeros(2 * d)
+    return out
 
 
-def _infer_dims(
-    segments: pd.DataFrame, cache: FeatureCache, modalities: List[str]
-) -> Dict[str, int]:
-    """Infer each modality's per-segment pooled dim from the cache."""
+def _infer_dims(segments: pd.DataFrame, cache: FeatureCache, modalities: List[str]) -> Dict[str, int]:
     dims: Dict[str, int] = {}
     for sid in segments["seg_id"]:
         feat = cache.load(sid)
@@ -94,9 +87,71 @@ def _infer_dims(
                 dims[m] = int(_pool_segment(feat[m]).shape[-1])
         if len(dims) == len(modalities):
             break
-    for m in modalities:  # fallback for entirely-absent modalities
+    for m in modalities:
         dims.setdefault(m, 1)
     return dims
+
+
+def _make_clf(C: float, penalty: str):
+    from sklearn.linear_model import LogisticRegression
+
+    solver = "liblinear" if penalty == "l1" else "lbfgs"
+    return LogisticRegression(
+        C=C, penalty=penalty, solver=solver, class_weight="balanced", max_iter=5000
+    )
+
+
+def _select_C(X: np.ndarray, y: np.ndarray, penalty: str, seed: int) -> float:
+    """Pick C by inner stratified CV AUC (falls back to 1.0 if degenerate)."""
+    from sklearn.model_selection import StratifiedKFold, cross_val_score
+
+    if len(np.unique(y)) < 2 or len(y) < 6:
+        return 1.0
+    best_C, best = 1.0, -np.inf
+    inner = StratifiedKFold(3, shuffle=True, random_state=seed)
+    for C in C_GRID:
+        try:
+            s = cross_val_score(_make_clf(C, penalty), X, y, cv=inner, scoring="roc_auc").mean()
+        except ValueError:
+            continue
+        if s > best:
+            best, best_C = s, C
+    return best_C
+
+
+def _fit_predict(
+    Xtr: np.ndarray,
+    ytr: np.ndarray,
+    Xte: np.ndarray,
+    C: str,
+    penalty: str,
+    pca: int,
+    calibrate: bool,
+    seed: int,
+) -> np.ndarray:
+    """Standardise -> (PCA) -> LogReg (-> calibrate); return test probabilities."""
+    from sklearn.preprocessing import StandardScaler
+
+    scaler = StandardScaler().fit(Xtr)
+    Xtr_s, Xte_s = scaler.transform(Xtr), scaler.transform(Xte)
+
+    if pca and pca > 0 and pca < min(Xtr_s.shape):
+        from sklearn.decomposition import PCA
+
+        red = PCA(n_components=pca, random_state=seed).fit(Xtr_s)
+        Xtr_s, Xte_s = red.transform(Xtr_s), red.transform(Xte_s)
+
+    C_val = _select_C(Xtr_s, ytr, penalty, seed) if C == "auto" else float(C)
+
+    if calibrate and len(ytr) >= 12 and len(np.unique(ytr)) == 2:
+        from sklearn.calibration import CalibratedClassifierCV
+
+        base = _make_clf(C_val, penalty)
+        clf = CalibratedClassifierCV(base, method="sigmoid", cv=3)
+        clf.fit(Xtr_s, ytr)
+    else:
+        clf = _make_clf(C_val, penalty).fit(Xtr_s, ytr)
+    return clf.predict_proba(Xte_s)[:, 1]
 
 
 def main() -> None:
@@ -105,15 +160,16 @@ def main() -> None:
     ap.add_argument("--segments", default="data/manifests/segments.csv")
     ap.add_argument("--cache_dir", default="data/interim/features")
     ap.add_argument("--modalities", default="audio,text")
+    ap.add_argument("--fusion", default="early", choices=["early", "late"])
+    ap.add_argument("--C", default="auto", help="'auto' (inner-CV) or a float.")
+    ap.add_argument("--penalty", default="l2", choices=["l2", "l1"])
+    ap.add_argument("--pca", type=int, default=30, help="PCA components (0=off).")
+    ap.add_argument("--calibrate", action="store_true")
     ap.add_argument("--n_folds", type=int, default=5)
     ap.add_argument("--seeds", default="0,1,2,3,4")
-    ap.add_argument("--C", type=float, default=1.0, help="Inverse L2 strength.")
     ap.add_argument("--out_dir", default="outputs")
     ap.add_argument("--exp_name", default="baseline_logreg")
     args = ap.parse_args()
-
-    from sklearn.linear_model import LogisticRegression
-    from sklearn.preprocessing import StandardScaler
 
     modalities = [m.strip() for m in args.modalities.split(",")]
     manifest = pd.read_csv(args.manifest)
@@ -123,13 +179,22 @@ def main() -> None:
     cache = FeatureCache(args.cache_dir)
 
     dims = _infer_dims(segments, cache, modalities)
-    logger.info("Per-segment pooled dims: %s", dims)
+    logger.info("Per-segment pooled dims: %s | fusion=%s C=%s pca=%d calib=%s",
+                dims, args.fusion, args.C, args.pca, args.calibrate)
 
     segs_by_pid = {pid: g["seg_id"].tolist() for pid, g in segments.groupby("participant_id")}
     pids = [p for p in manifest["participant_id"] if p in segs_by_pid]
     logger.info("Building pooled vectors for %d participants...", len(pids))
 
-    X = np.stack([_participant_vector(segs_by_pid[p], cache, dims, modalities) for p in pids])
+    # Per-modality feature matrices (so late fusion can train separately).
+    mod_mats: Dict[str, List[np.ndarray]] = {m: [] for m in modalities}
+    for p in pids:
+        vecs = _modality_vectors(segs_by_pid[p], cache, dims, modalities)
+        for m in modalities:
+            mod_mats[m].append(vecs[m])
+    Xmod = {m: np.stack(v) for m, v in mod_mats.items()}
+    Xfull = np.concatenate([Xmod[m] for m in modalities], axis=1)
+
     label_by_pid = dict(zip(manifest["participant_id"], manifest["label"]))
     y = np.array([int(label_by_pid[p]) for p in pids])
     pid_index = {p: i for i, p in enumerate(pids)}
@@ -145,11 +210,19 @@ def main() -> None:
         for fold, (tr, te) in enumerate(splitter.folds()):
             tr_idx = [pid_index[p] for p in tr if p in pid_index]
             te_idx = [pid_index[p] for p in te if p in pid_index]
-            scaler = StandardScaler().fit(X[tr_idx])
-            clf = LogisticRegression(
-                C=args.C, class_weight="balanced", max_iter=2000
-            ).fit(scaler.transform(X[tr_idx]), y[tr_idx])
-            prob = clf.predict_proba(scaler.transform(X[te_idx]))[:, 1]
+
+            if args.fusion == "late" and len(modalities) > 1:
+                probs = []
+                for m in modalities:
+                    probs.append(_fit_predict(
+                        Xmod[m][tr_idx], y[tr_idx], Xmod[m][te_idx],
+                        args.C, args.penalty, args.pca, args.calibrate, seed))
+                prob = np.mean(probs, axis=0)
+            else:
+                prob = _fit_predict(
+                    Xfull[tr_idx], y[tr_idx], Xfull[te_idx],
+                    args.C, args.penalty, args.pca, args.calibrate, seed)
+
             per_run.append(compute_all_metrics(y[te_idx], prob, threshold=0.5))
             for j, p in enumerate([pids[i] for i in te_idx]):
                 all_pred["participant_id"].append(p)
@@ -171,7 +244,9 @@ def main() -> None:
         "experiment": args.exp_name,
         "n_participants": len(pooled),
         "modalities": modalities,
-        "feature_dim": int(X.shape[1]),
+        "fusion": args.fusion,
+        "C": args.C, "penalty": args.penalty, "pca": args.pca, "calibrate": args.calibrate,
+        "feature_dim": int(Xfull.shape[1]),
         "aggregate": agg,
         "auc_bootstrap": {"mean": auc_mean, "ci95": [lo, hi]},
     }
@@ -180,7 +255,6 @@ def main() -> None:
     pred_df.to_csv(out_dir / f"{args.exp_name}_preds.csv", index=False)
 
     logger.info("=== Simple baseline (%s) ===", args.exp_name)
-    logger.info("feature_dim=%d | n=%d", X.shape[1], len(pooled))
     logger.info("AUC per-run: %.3f +/- %.3f (n=%d)",
                 agg["auc"]["mean"], agg["auc"]["std"], agg["auc"]["n"])
     logger.info("AUC pooled bootstrap: %.3f  CI95 [%.3f, %.3f]", auc_mean, lo, hi)
