@@ -122,16 +122,18 @@ def main() -> None:
     n_groups = builder.n_groups()
     n_corpus = int(builder.manifest["corpus_id"].max()) + 1
 
-    # Acoustic input dim is inferred from the cached features (e.g. 79 for
-    # COVAREP, 25 for openSMILE eGeMAPS) so the encoder matches the data.
-    in_dims = None
-    sample = builder.build(list(builder.manifest.index[:1]))
-    if sample:
-        for seg in sample[0].segments:
-            ac = seg.get("acoustic")
-            if ac is not None:
-                in_dims = {"acoustic": int(np.asarray(ac).shape[-1])}
-                break
+    # Infer each sequence modality's input dim from the cached features so the
+    # encoders match the data (e.g. COVAREP 74/79, openSMILE 25, CLNF variants).
+    in_dims: dict = {}
+    sample = builder.build(list(builder.manifest.index[:20]))
+    for bag in sample:
+        for seg in bag.segments:
+            for m in ("audio", "acoustic", "visual"):
+                if m not in in_dims and seg.get(m) is not None:
+                    in_dims[m] = int(np.asarray(seg[m]).shape[-1])
+    in_dims = in_dims or None
+    if in_dims:
+        logger.info("Inferred modality input dims from cache: %s", in_dims)
 
     def model_factory() -> TransValNet:
         return TransValNet(

@@ -1,0 +1,37 @@
+# DAIC-WOZ full 4-modality experiment (audio + acoustic/COVAREP + text + visual/CLNF).
+# The Kaggle DAIC-WOZ distribution ships COVAREP and CLNF, so all branches are
+# active. Single corpus -> corpus-adversary inert; gender-adversary + Group-DRO
+# active. Encoder input dims are auto-inferred from the cached features.
+model:
+  d: 64
+  dropout: 0.3
+  use_adv: true
+  use_group_dro: true
+  use_irm: false
+  use_visual: true
+  n_gender: 2
+
+loss:
+  alpha: 0.3
+  beta: 0.3
+  gamma: 0.1
+  pos_weight: 2.34        # ~= (187-56)/56 for the observed class balance
+
+train:
+  epochs: 40
+  lr: 5.0e-4
+  batch_bags: 8
+  patience: 8
+  weight_decay: 1.0e-4
+
+calib:
+  method: platt
+  threshold: fixed
+
+cv:
+  n_folds: 5
+  seeds: [0, 1, 2, 3, 4]
+  mode: pooled
+  exp_name: daic_all
+
+# Run: --modalities audio,acoustic,text,visual
